@@ -88,6 +88,8 @@ function setupExtension(flags: Record<string, string> = {}) {
 		registerTool: vi.fn(),
 		registerFlag: vi.fn(),
 		getFlag: (name: string) => flags[name],
+		// The bridge probes git to warn about a committable config; report "ignored".
+		exec: vi.fn(async () => ({ stdout: "", stderr: "", code: 0, killed: false })),
 	} as unknown as ExtensionAPI;
 
 	const abort = vi.fn(async () => {});
@@ -154,6 +156,8 @@ describe("dingtalk bridge extension", () => {
 
 	beforeEach(() => {
 		sandboxDir = mkdtempSync(join(tmpdir(), "dingtalk-ext-"));
+		// A .git marker bounds the upward project-config search inside the sandbox.
+		mkdirSync(join(sandboxDir, ".git"), { recursive: true });
 		vi.stubEnv("PRIME_AGENT_CODING_AGENT_DIR", sandboxDir);
 		FakeSocket.instances = [];
 		const fetchSetup = setupFetch();

@@ -23,7 +23,7 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type DingTalkConfig, isConfigured, resolveConfig } from "./config.js";
-import { CONFIG_FLAG, discoverConfigPath, readConfigFile } from "./config-file.js";
+import { CONFIG_FLAG, checkGitExposure, discoverConfigPath, readConfigFile } from "./config-file.js";
 import { DingTalkApi } from "./dingtalk-api.js";
 import { formatAnswer, formatQuestion, splitMarkdown, summarize } from "./markdown.js";
 import { InboundRouter, mirrorTargets, parseBridgeCommand, ReplyQueue } from "./router.js";
@@ -239,7 +239,12 @@ export default function dingTalkExtension(pi: ExtensionAPI): void {
 		if (!isConfigured(process.env, target !== undefined)) return;
 
 		const resolved = resolveConfig({ env: process.env, file: fileResult.file });
-		for (const warning of [...fileResult.warnings, ...resolved.warnings]) log("warn", warning);
+		const gitWarning = target
+			? await checkGitExposure(target.path, (command, args, options) => pi.exec(command, args, options))
+			: undefined;
+		for (const warning of [...fileResult.warnings, ...(gitWarning ? [gitWarning] : []), ...resolved.warnings]) {
+			log("warn", warning);
+		}
 
 		const problems = [...fileResult.errors, ...resolved.errors];
 		if (problems.length > 0 || !resolved.config) {

@@ -2,7 +2,7 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { discoverConfigPath, readConfigFile } from "../examples/extensions/dingtalk/config-file.js";
+import { checkGitExposure, discoverConfigPath, readConfigFile } from "../examples/extensions/dingtalk/config-file.js";
 
 let root: string;
 let cwd: string;
@@ -49,6 +49,36 @@ describe("discoverConfigPath", () => {
 			path: envPath,
 			explicit: true,
 		});
+	});
+
+	it("finds the project file from a subdirectory, up to the git root", () => {
+		// One bot per repo: running the agent from packages/api must still find the repo's bot.
+		writeJson(join(cwd, ".prime", "agent", "dingtalk.json"), {});
+		mkdirSync(join(cwd, ".git"), { recursive: true });
+		const deep = join(cwd, "packages", "api", "src");
+		mkdirSync(deep, { recursive: true });
+
+		expect(discoverConfigPath({ env: {}, cwd: deep, agentDir })).toEqual({
+			path: join(cwd, ".prime", "agent", "dingtalk.json"),
+			explicit: false,
+		});
+	});
+
+	it("does not escape the git root when the repo has no config", () => {
+		// An outer directory's config must not leak into an unrelated repository.
+		writeJson(join(root, ".prime", "agent", "dingtalk.json"), {});
+		mkdirSync(join(cwd, ".git"), { recursive: true });
+
+		expect(discoverConfigPath({ env: {}, cwd, agentDir })).toBeUndefined();
+	});
+
+	it("prefers the innermost project config", () => {
+		writeJson(join(cwd, ".prime", "agent", "dingtalk.json"), {});
+		mkdirSync(join(cwd, ".git"), { recursive: true });
+		const inner = join(cwd, "packages", "api");
+		const innerPath = writeJson(join(inner, ".prime", "agent", "dingtalk.json"), {});
+
+		expect(discoverConfigPath({ env: {}, cwd: inner, agentDir })?.path).toBe(innerPath);
 	});
 
 	it("then the project file, then the global one", () => {
@@ -115,5 +145,40 @@ describe("readConfigFile", () => {
 		chmodSync(path, 0o600);
 
 		expect(readConfigFile({ path, explicit: true }).warnings).toEqual([]);
+	});
+});
+
+describe("checkGitExposure", () => {
+	const path = "/repo/.prime/agent/dingtalk.json";
+
+	function exec(codes: Record<string, number>) {
+		return async (_command: string, args: string[]) => ({
+			code: args.includes("check-ignore") ? codes.checkIgnore : codes.inWorkTree,
+		});
+	}
+
+	it("warns when the config is in a repo and not ignored", async () => {
+		const warning = await checkGitExposure(path, exec({ inWorkTree: 0, checkIgnore: 1 }));
+		expect(warning).toContain("not ignored");
+		expect(warning).toContain("AppSecret");
+	});
+
+	it("stays quiet when the file is ignored", async () => {
+		expect(await checkGitExposure(path, exec({ inWorkTree: 0, checkIgnore: 0 }))).toBeUndefined();
+	});
+
+	it("stays quiet outside a git work tree", async () => {
+		expect(await checkGitExposure(path, exec({ inWorkTree: 128, checkIgnore: 1 }))).toBeUndefined();
+	});
+
+	it("stays quiet when git cannot answer, rather than crying wolf", async () => {
+		expect(await checkGitExposure(path, exec({ inWorkTree: 0, checkIgnore: 128 }))).toBeUndefined();
+	});
+
+	it("stays quiet when git is missing entirely", async () => {
+		const throwing = async () => {
+			throw new Error("spawn git ENOENT");
+		};
+		expect(await checkGitExposure(path, throwing)).toBeUndefined();
 	});
 });

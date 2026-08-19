@@ -86,11 +86,35 @@ Checked in order; the first hit is used:
 
 1. `--dingtalk-config <path>` (relative paths resolve against the working directory)
 2. `DINGTALK_CONFIG=<path>`
-3. `<cwd>/.prime/agent/dingtalk.json` — per-project bot, no flag needed
+3. `.prime/agent/dingtalk.json`, searched from the working directory **up to the git repository
+   root** — per-project bot, no flag needed
 4. `~/.prime/agent/dingtalk.json` — your default bot
 
 A path named by the flag or `DINGTALK_CONFIG` must exist; a missing file there is an error
 rather than a silent fallback. The discovered defaults may be absent without complaint.
+
+### One bot per repository
+
+Put the config at the repository root and no flag is needed anywhere inside it:
+
+```
+my-service/
+├── .git/
+├── .prime/agent/dingtalk.json    ← this repo's bot
+└── packages/api/                 ← `prime-agent` here finds it too
+```
+
+The search stops at the repository root, so a config in an outer directory never leaks into an
+unrelated repository.
+
+The file holds an AppSecret, so **gitignore it**:
+
+```bash
+echo ".prime/agent/dingtalk.json" >> .gitignore
+```
+
+Startup warns if the config is inside a git repository and not ignored, in case a `git add .`
+would have published your credentials.
 
 With **no** config file and no `DINGTALK_*` variables, the extension stays completely silent,
 so it is safe to drop into `~/.prime/agent/extensions/` and have it load in every session.
