@@ -21,8 +21,18 @@ const SEEN_LIMIT = 512;
 const MIRROR_ONLY_NOTICE =
 	"本群是围观模式：这里只同步问答记录，不接受指令。请**私聊我**下达任务，过程会自动同步到本群。";
 
-const NOT_ALLOWED_NOTICE =
-	"你不在本 Agent 的白名单里，指令未执行。请联系管理员把你的 staffId 加入 `DINGTALK_ALLOW_USERS`。";
+/**
+ * Echoes the sender's own staff id back to them.
+ *
+ * The allowlist is mandatory, so the first thing a new user needs is their own id to hand to
+ * whoever runs the agent. Without this the setup is a chicken-and-egg problem.
+ */
+function notAllowedNotice(staffId: string): string {
+	const who = staffId
+		? `你的 staffId 是 \`${staffId}\`。`
+		: "钉钉没有返回你的 staffId（外部联系人无法使用本 Agent）。";
+	return `你不在本 Agent 的白名单里，指令未执行。${who}请联系管理员把它加入 \`DINGTALK_ALLOW_USERS\`。`;
+}
 
 /** Recognize the bridge-level commands that never reach the agent. */
 export function parseBridgeCommand(text: string): BridgeCommand | undefined {
@@ -87,7 +97,7 @@ export class InboundRouter {
 		}
 
 		if (!message.senderStaffId || !this.config.allowUsers.includes(message.senderStaffId)) {
-			return this.notice(target, "sender is not allowlisted", NOT_ALLOWED_NOTICE);
+			return this.notice(target, "sender is not allowlisted", notAllowedNotice(message.senderStaffId));
 		}
 
 		return { action: "inject", target, text: message.text };

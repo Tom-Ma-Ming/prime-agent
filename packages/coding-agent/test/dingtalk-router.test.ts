@@ -64,11 +64,17 @@ describe("InboundRouter — private chat is conversational", () => {
 		if (decision.action !== "notice") return;
 		expect(decision.reason).toBe("sender is not allowlisted");
 		expect(decision.notice).toContain("白名单");
+		// The allowlist is mandatory, so the refusal has to tell the sender what to ask for.
+		expect(decision.notice).toContain("staff-mallory");
 	});
 
 	it("refuses a sender with no resolvable staff id", () => {
 		const router = new InboundRouter(config());
-		expect(router.decide(message({ senderStaffId: "" })).action).toBe("notice");
+		const decision = router.decide(message({ senderStaffId: "" }));
+
+		expect(decision.action).toBe("notice");
+		if (decision.action !== "notice") return;
+		expect(decision.notice).toContain("外部联系人");
 	});
 });
 

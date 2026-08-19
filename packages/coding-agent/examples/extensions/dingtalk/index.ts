@@ -163,8 +163,13 @@ export default function dingTalkExtension(pi: ExtensionAPI): void {
 	const handleInbound = async (message: InboundMessage, cfg: DingTalkConfig) => {
 		if (!router || !context) return;
 
-		// Logged so a new spectator group can be wired up: @-mention the bot once and copy the id.
-		log("info", `message from ${message.senderNick} in ${message.kind} ${message.conversationId}`);
+		// Logged so a new user or spectator group can be wired up: @-mention the bot once,
+		// then copy the staff id into DINGTALK_ALLOW_USERS or the conversation id into
+		// DINGTALK_MIRROR_CONVERSATIONS.
+		log(
+			"info",
+			`message from ${message.senderNick} (staffId=${message.senderStaffId || "unknown"}) in ${message.kind} ${message.conversationId}`,
+		);
 
 		const decision = router.decide(message);
 		if (decision.action === "ignore") {

@@ -47,6 +47,9 @@ prime-agent -e ./examples/extensions/dingtalk/index.ts
 
 Send the bot a private message. It should answer.
 
+Don't know your staff id? Start the bridge with a placeholder allowlist and message the bot:
+the refusal reply tells you your own id, and the log line prints it too.
+
 ### 3. Wire up a spectator group
 
 Add the bot to a group and @-mention it once. The bridge logs the conversation id:
