@@ -1,3 +1,6 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import dingTalkExtension from "../examples/extensions/dingtalk/index.js";
 import type { ExtensionAPI, ExtensionContext } from "../src/core/extensions/index.js";
@@ -70,7 +73,7 @@ function setupFetch() {
 
 type Handler = (event: any, ctx: ExtensionContext) => unknown;
 
-function setupExtension() {
+function setupExtension(flags: Record<string, string> = {}) {
 	const handlers = new Map<string, Handler[]>();
 	const sendUserMessage = vi.fn();
 	const api = {
@@ -83,6 +86,8 @@ function setupExtension() {
 		sendMessage: vi.fn(),
 		registerCommand: vi.fn(),
 		registerTool: vi.fn(),
+		registerFlag: vi.fn(),
+		getFlag: (name: string) => flags[name],
 	} as unknown as ExtensionAPI;
 
 	const abort = vi.fn(async () => {});
@@ -90,7 +95,7 @@ function setupExtension() {
 	const ctx = {
 		hasUI: false,
 		ui: {} as ExtensionContext["ui"],
-		cwd: process.cwd(),
+		cwd: sandboxDir,
 		isIdle: () => idle,
 		abort,
 		hasPendingMessages: () => false,
@@ -141,10 +146,15 @@ function titleOf(call: HttpCall): string {
 	return JSON.parse(call.body.msgParam).title;
 }
 
+/** Isolated cwd + agent dir, so a real ~/.prime/agent/dingtalk.json cannot leak into these tests. */
+let sandboxDir: string;
+
 describe("dingtalk bridge extension", () => {
 	let calls: HttpCall[];
 
 	beforeEach(() => {
+		sandboxDir = mkdtempSync(join(tmpdir(), "dingtalk-ext-"));
+		vi.stubEnv("PRIME_AGENT_CODING_AGENT_DIR", sandboxDir);
 		FakeSocket.instances = [];
 		const fetchSetup = setupFetch();
 		calls = fetchSetup.calls;
@@ -162,10 +172,11 @@ describe("dingtalk bridge extension", () => {
 	afterEach(() => {
 		vi.unstubAllGlobals();
 		vi.unstubAllEnvs();
+		rmSync(sandboxDir, { recursive: true, force: true });
 	});
 
-	async function start() {
-		const harness = setupExtension();
+	async function start(flags: Record<string, string> = {}) {
+		const harness = setupExtension(flags);
 		await harness.fire("session_start", {});
 		const socket = FakeSocket.instances[0];
 		expect(socket).toBeDefined();
@@ -333,13 +344,91 @@ describe("dingtalk bridge extension", () => {
 		});
 	});
 
-	describe("configuration failures", () => {
+	describe("configuration", () => {
+		function writeConfig(name: string, contents: unknown): string {
+			const path = join(sandboxDir, name);
+			writeFileSync(path, JSON.stringify(contents));
+			return path;
+		}
+
 		it("stays disabled and opens no connection when credentials are missing", async () => {
 			vi.stubEnv("DINGTALK_CLIENT_ID", "");
 			const harness = setupExtension();
 			await harness.fire("session_start", {});
 
 			expect(FakeSocket.instances).toHaveLength(0);
+		});
+
+		it("stays completely silent when nothing configures the bridge", async () => {
+			vi.unstubAllEnvs();
+			vi.stubEnv("PRIME_AGENT_CODING_AGENT_DIR", sandboxDir);
+			const errors: string[] = [];
+			const spy = vi.spyOn(console, "error").mockImplementation((line) => void errors.push(String(line)));
+
+			const harness = setupExtension();
+			await harness.fire("session_start", {});
+
+			expect(FakeSocket.instances).toHaveLength(0);
+			expect(errors).toEqual([]);
+			spy.mockRestore();
+		});
+
+		it("runs the bot named by --dingtalk-config", async () => {
+			const path = writeConfig("bot-a.json", {
+				clientId: "file-key",
+				clientSecret: "file-secret",
+				allowUsers: ["staff-carol"],
+				mirrorConversations: ["group-a"],
+			});
+
+			await start({ "dingtalk-config": path });
+
+			const open = calls.find((call) => call.url.includes("gateway/connections/open"));
+			expect(open?.body.clientId).toBe("file-key");
+		});
+
+		it("lets the chosen file override a stale environment variable", async () => {
+			// A leftover DINGTALK_CLIENT_ID must not connect the wrong bot with this bot's allowlist.
+			const path = writeConfig("bot-b.json", {
+				clientId: "file-key",
+				clientSecret: "file-secret",
+				allowUsers: ["staff-carol"],
+			});
+
+			const { socket, sendUserMessage } = await start({ "dingtalk-config": path });
+
+			const open = calls.find((call) => call.url.includes("gateway/connections/open"));
+			expect(open?.body.clientId).toBe("file-key");
+
+			// The env allowlist (staff-alice) no longer applies; the file's does.
+			socket.deliverBotMessage(botMessage({ senderStaffId: "staff-alice" }));
+			await vi.waitFor(() => expect(webhookSends(calls)).toHaveLength(1));
+			expect(sendUserMessage).not.toHaveBeenCalled();
+
+			socket.deliverBotMessage(botMessage({ senderStaffId: "staff-carol" }));
+			await vi.waitFor(() => expect(sendUserMessage).toHaveBeenCalledWith("跑一下测试"));
+		});
+
+		it("refuses to start when the named config file is missing", async () => {
+			const harness = setupExtension({ "dingtalk-config": join(sandboxDir, "absent.json") });
+			await harness.fire("session_start", {});
+
+			expect(FakeSocket.instances).toHaveLength(0);
+		});
+
+		it("picks up a project config file with no flag at all", async () => {
+			mkdirSync(join(sandboxDir, ".prime", "agent"), { recursive: true });
+			writeFileSync(
+				join(sandboxDir, ".prime", "agent", "dingtalk.json"),
+				JSON.stringify({ clientId: "project-key", clientSecret: "s", allowUsers: ["staff-alice"] }),
+			);
+			vi.unstubAllEnvs();
+			vi.stubEnv("PRIME_AGENT_CODING_AGENT_DIR", sandboxDir);
+
+			await start();
+
+			const open = calls.find((call) => call.url.includes("gateway/connections/open"));
+			expect(open?.body.clientId).toBe("project-key");
 		});
 	});
 

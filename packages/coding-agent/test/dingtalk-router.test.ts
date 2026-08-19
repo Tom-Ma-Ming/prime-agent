@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { type DingTalkConfig, loadConfig } from "../examples/extensions/dingtalk/config.js";
+import { type DingTalkConfig, isConfigured, resolveConfig } from "../examples/extensions/dingtalk/config.js";
 import {
 	InboundRouter,
 	mirrorTargets,
@@ -259,41 +259,158 @@ describe("normalizeBotMessage", () => {
 	});
 });
 
-describe("loadConfig", () => {
-	const base = {
-		DINGTALK_CLIENT_ID: "key",
-		DINGTALK_CLIENT_SECRET: "secret",
+describe("resolveConfig", () => {
+	const env = {
+		DINGTALK_CLIENT_ID: "env-key",
+		DINGTALK_CLIENT_SECRET: "env-secret",
 		DINGTALK_ALLOW_USERS: "staff-alice, staff-bob",
 	};
 
 	it("requires credentials and a non-empty allowlist", () => {
-		const result = loadConfig({});
+		const result = resolveConfig({ env: {} });
 		expect(result.config).toBeUndefined();
 		expect(result.errors).toHaveLength(3);
-		expect(result.errors.join(" ")).toContain("DINGTALK_ALLOW_USERS");
+		expect(result.errors.join(" ")).toContain("allowUsers is required");
 	});
 
-	it("defaults groups to mirror mode", () => {
-		const result = loadConfig(base);
-		expect(result.config?.groupMode).toBe("mirror");
+	it("reads everything from the environment when there is no file", () => {
+		const result = resolveConfig({ env });
+		expect(result.config?.clientId).toBe("env-key");
 		expect(result.config?.allowUsers).toEqual(["staff-alice", "staff-bob"]);
-		expect(result.config?.robotCode).toBe("key");
+		expect(result.config?.robotCode).toBe("env-key");
+		expect(result.config?.groupMode).toBe("mirror");
+	});
+
+	it("reads everything from a file when there is no environment", () => {
+		const result = resolveConfig({
+			env: {},
+			file: {
+				path: "/bots/a.json",
+				contents: {
+					clientId: "file-key",
+					clientSecret: "file-secret",
+					allowUsers: ["staff-carol"],
+					mirrorConversations: ["cid-1", "cid-2"],
+					groupMode: "interactive",
+					mirrorTools: true,
+					maxChars: 2000,
+				},
+			},
+		});
+
+		expect(result.errors).toEqual([]);
+		expect(result.config).toMatchObject({
+			clientId: "file-key",
+			clientSecret: "file-secret",
+			allowUsers: ["staff-carol"],
+			mirrorConversationIds: ["cid-1", "cid-2"],
+			groupMode: "interactive",
+			mirrorTools: true,
+			maxChars: 2000,
+		});
+	});
+
+	it("lets the file win over ambient environment variables", () => {
+		// The whole point of pointing at a file: a stale env var must not connect the wrong bot.
+		const result = resolveConfig({
+			env,
+			file: {
+				path: "/bots/b.json",
+				contents: { clientId: "file-key", clientSecret: "file-secret", allowUsers: ["staff-carol"] },
+			},
+		});
+
+		expect(result.config?.clientId).toBe("file-key");
+		expect(result.config?.clientSecret).toBe("file-secret");
+		expect(result.config?.allowUsers).toEqual(["staff-carol"]);
+	});
+
+	it("falls back to the environment for keys the file omits", () => {
+		const result = resolveConfig({
+			env: { ...env, DINGTALK_GROUP_MODE: "interactive" },
+			file: { path: "/bots/c.json", contents: { clientId: "file-key" } },
+		});
+
+		expect(result.config?.clientId).toBe("file-key");
+		expect(result.config?.clientSecret).toBe("env-secret");
+		expect(result.config?.groupMode).toBe("interactive");
+	});
+
+	it("accepts a comma-separated string where a list is expected", () => {
+		const result = resolveConfig({
+			env: {},
+			file: {
+				path: "/bots/d.json",
+				contents: { clientId: "k", clientSecret: "s", allowUsers: "staff-a, staff-b" },
+			},
+		});
+
+		expect(result.config?.allowUsers).toEqual(["staff-a", "staff-b"]);
+	});
+
+	it("flags a typo instead of silently ignoring it", () => {
+		const result = resolveConfig({
+			env: {},
+			file: {
+				path: "/bots/e.json",
+				contents: { clientId: "k", clientSecret: "s", allowUsers: ["a"], allowedUsers: ["b"] },
+			},
+		});
+
+		expect(result.warnings.join(" ")).toContain('unknown setting "allowedUsers"');
+	});
+
+	it("reports wrong types in the file with the path", () => {
+		const result = resolveConfig({
+			env: {},
+			file: { path: "/bots/f.json", contents: { clientId: 42, allowUsers: "a", clientSecret: "s" } },
+		});
+
+		expect(result.config).toBeUndefined();
+		expect(result.errors.join(" ")).toContain("/bots/f.json");
+		expect(result.errors.join(" ")).toContain('"clientId" must be a string');
+	});
+
+	it("rejects a file that is not a JSON object", () => {
+		const result = resolveConfig({ env, file: { path: "/bots/g.json", contents: ["nope"] } });
+		expect(result.errors.join(" ")).toContain("must contain a JSON object");
+	});
+
+	it("rejects an unknown group mode and streaming behavior", () => {
+		const readonly = resolveConfig({ env: { ...env, DINGTALK_GROUP_MODE: "readonly" } });
+		expect(readonly.errors.join(" ")).toContain("groupMode");
+
+		const behavior = resolveConfig({ env: { ...env, DINGTALK_STREAMING_BEHAVIOR: "yolo" } });
+		expect(behavior.errors.join(" ")).toContain("streamingBehavior");
+	});
+
+	it("rejects a nonsensical message size from either source", () => {
+		expect(resolveConfig({ env: { ...env, DINGTALK_MAX_CHARS: "12" } }).errors.join(" ")).toContain("maxChars");
+		expect(
+			resolveConfig({
+				env,
+				file: { path: "/bots/h.json", contents: { maxChars: 1.5 } },
+			}).errors.join(" "),
+		).toContain('"maxChars" must be an integer');
 	});
 
 	it("warns when no spectator group is configured", () => {
-		expect(loadConfig(base).warnings.join(" ")).toContain("DINGTALK_MIRROR_CONVERSATIONS");
+		expect(resolveConfig({ env }).warnings.join(" ")).toContain("mirrorConversations");
+	});
+});
+
+describe("isConfigured", () => {
+	it("is true when a config file was found", () => {
+		expect(isConfigured({}, true)).toBe(true);
 	});
 
-	it("rejects an unknown group mode", () => {
-		const result = loadConfig({ ...base, DINGTALK_GROUP_MODE: "readonly" });
-		expect(result.config).toBeUndefined();
-		expect(result.errors.join(" ")).toContain("DINGTALK_GROUP_MODE");
+	it("is true when any DINGTALK_ variable is set", () => {
+		expect(isConfigured({ DINGTALK_CLIENT_ID: "k" }, false)).toBe(true);
 	});
 
-	it("rejects a nonsensical message size", () => {
-		const result = loadConfig({ ...base, DINGTALK_MAX_CHARS: "12" });
-		expect(result.config).toBeUndefined();
-		expect(result.errors.join(" ")).toContain("DINGTALK_MAX_CHARS");
+	it("is false for an unrelated environment, so the extension stays silent", () => {
+		expect(isConfigured({ PATH: "/usr/bin", HOME: "/root" }, false)).toBe(false);
+		expect(isConfigured({ DINGTALK_CLIENT_ID: "  " }, false)).toBe(false);
 	});
 });
 

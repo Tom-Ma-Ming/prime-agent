@@ -1,0 +1,12 @@
+{
+	"clientId": "your-app-key",
+	"clientSecret": "your-app-secret",
+	"allowUsers": ["01234567890123"],
+	"mirrorConversations": ["cidXXXXXXXXXXXXXXXXXXXX="],
+	"groupMode": "mirror",
+	"mirrorTools": false,
+	"maxChars": 3500,
+	"streamingBehavior": "followUp",
+	"progressAfterMs": 20000,
+	"noticeCooldownMs": 3600000
+}

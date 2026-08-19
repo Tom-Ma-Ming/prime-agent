@@ -13,14 +13,17 @@
  *
  * Setup and configuration: see README.md next to this file.
  *
- * Usage:
- *   export DINGTALK_CLIENT_ID=... DINGTALK_CLIENT_SECRET=... DINGTALK_ALLOW_USERS=staff1,staff2
- *   prime-agent -e ./examples/extensions/dingtalk/index.ts
+ * Usage — one JSON file per bot, chosen at launch:
+ *   prime-agent --dingtalk-config ~/bots/team-a.json
+ *
+ * Environment variables (DINGTALK_*) work too, and fill in whatever the file omits.
+ * With neither, the extension stays silent, so it is safe to install globally.
  */
 
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { type DingTalkConfig, loadConfig } from "./config.js";
+import { type DingTalkConfig, isConfigured, resolveConfig } from "./config.js";
+import { CONFIG_FLAG, discoverConfigPath, readConfigFile } from "./config-file.js";
 import { DingTalkApi } from "./dingtalk-api.js";
 import { formatAnswer, formatQuestion, splitMarkdown, summarize } from "./markdown.js";
 import { InboundRouter, mirrorTargets, parseBridgeCommand, ReplyQueue } from "./router.js";
@@ -42,7 +45,13 @@ interface CardSession {
 }
 
 export default function dingTalkExtension(pi: ExtensionAPI): void {
-	const { config, errors, warnings } = loadConfig(process.env);
+	pi.registerFlag(CONFIG_FLAG, {
+		description: "Path to a DingTalk bridge config file (one per bot)",
+		type: "string",
+	});
+
+	// Resolved on session_start: CLI flags are not available while the factory runs.
+	let config: DingTalkConfig | undefined;
 
 	let context: ExtensionContext | undefined;
 	let api: DingTalkApi | undefined;
@@ -218,17 +227,35 @@ export default function dingTalkExtension(pi: ExtensionAPI): void {
 	pi.on("session_start", async (_event, ctx) => {
 		context = ctx;
 
-		for (const warning of warnings) log("warn", warning);
-		if (!config) {
-			for (const error of errors) log("error", error);
+		const target = discoverConfigPath({
+			flag: pi.getFlag(CONFIG_FLAG) as string | undefined,
+			env: process.env,
+			cwd: ctx.cwd,
+		});
+		const fileResult = target ? readConfigFile(target) : { errors: [], warnings: [] };
+
+		// Nothing points at this bridge, so this session simply does not want a bot.
+		// Staying quiet is what makes the extension safe to install globally.
+		if (!isConfigured(process.env, target !== undefined)) return;
+
+		const resolved = resolveConfig({ env: process.env, file: fileResult.file });
+		for (const warning of [...fileResult.warnings, ...resolved.warnings]) log("warn", warning);
+
+		const problems = [...fileResult.errors, ...resolved.errors];
+		if (problems.length > 0 || !resolved.config) {
+			for (const problem of problems) log("error", problem);
 			log("error", "DingTalk bridge disabled. Fix the configuration above and restart.");
 			return;
 		}
 
-		api = new DingTalkApi(config);
-		router = new InboundRouter(config);
-		stream = new DingTalkStreamClient(config, {
-			onBotMessage: (message) => handleInbound(message, config),
+		const active = resolved.config;
+		config = active;
+		if (target) log("info", `config loaded from ${target.path}`);
+
+		api = new DingTalkApi(active);
+		router = new InboundRouter(active);
+		stream = new DingTalkStreamClient(active, {
+			onBotMessage: (message) => handleInbound(message, active),
 			onUnsupported: (raw) => log("info", `ignored an unsupported message type: ${raw.msgtype}`),
 			onLog: log,
 		});
@@ -236,7 +263,7 @@ export default function dingTalkExtension(pi: ExtensionAPI): void {
 		await stream.start();
 		log(
 			"info",
-			`bridge started · 群模式=${config.groupMode} · 围观群=${config.mirrorConversationIds.length} · 白名单=${config.allowUsers.length} 人`,
+			`bridge started · 群模式=${active.groupMode} · 围观群=${active.mirrorConversationIds.length} · 白名单=${active.allowUsers.length} 人`,
 		);
 	});
 
@@ -250,20 +277,21 @@ export default function dingTalkExtension(pi: ExtensionAPI): void {
 
 	pi.on("agent_start", async () => {
 		if (!config || !api) return;
+		const cfg = config;
 		const target = queue.peek();
 
-		if (config.progressAfterMs > 0 && target) {
+		if (cfg.progressAfterMs > 0 && target) {
 			clearProgressTimer();
 			progressTimer = setTimeout(() => {
 				progressTimer = undefined;
 				void deliver(
-					() => sendChunked(target, "处理中", "任务还在进行中，完成后会把结果发给你。", config),
+					() => sendChunked(target, "处理中", "任务还在进行中，完成后会把结果发给你。", cfg),
 					"progress notice",
 				);
-			}, config.progressAfterMs);
+			}, cfg.progressAfterMs);
 		}
 
-		if (config.cardTemplateId && target) {
+		if (cfg.cardTemplateId && target) {
 			const outTrackId = randomUUID();
 			try {
 				await api.createCard(target, outTrackId, "…");
@@ -294,6 +322,7 @@ export default function dingTalkExtension(pi: ExtensionAPI): void {
 
 	pi.on("agent_end", async (event) => {
 		if (!config) return;
+		const cfg = config;
 		clearProgressTimer();
 
 		const target = queue.shift();
@@ -307,10 +336,10 @@ export default function dingTalkExtension(pi: ExtensionAPI): void {
 		const title = target?.question ? `↩ ${summarize(target.question)}` : "Prime Agent";
 
 		if (target && !streamedToCard) {
-			await deliver(() => sendChunked(target, title, answer, config), "reply");
+			await deliver(() => sendChunked(target, title, answer, cfg), "reply");
 		}
 
-		await mirror(title, formatAnswer(target?.askerNick, answer), target?.conversationId, config);
+		await mirror(title, formatAnswer(target?.askerNick, answer), target?.conversationId, cfg);
 	});
 
 	pi.on("session_shutdown", async () => {

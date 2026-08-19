@@ -37,18 +37,22 @@ In the [DingTalk developer console](https://open-dev.dingtalk.com/): create an
 
 ### 2. Configure and run
 
-```bash
-export DINGTALK_CLIENT_ID=<AppKey>
-export DINGTALK_CLIENT_SECRET=<AppSecret>
-export DINGTALK_ALLOW_USERS=staff_id_1,staff_id_2
+Copy `dingtalk.example.json`, fill in the two credentials and your own staff id, and keep it
+private — the file holds an AppSecret:
 
-prime-agent -e ./examples/extensions/dingtalk/index.ts
+```bash
+mkdir -p ~/bots
+cp examples/extensions/dingtalk/dingtalk.example.json ~/bots/team-a.json
+chmod 600 ~/bots/team-a.json
+$EDITOR ~/bots/team-a.json
+
+prime-agent --dingtalk-config ~/bots/team-a.json
 ```
 
 Send the bot a private message. It should answer.
 
-Don't know your staff id? Start the bridge with a placeholder allowlist and message the bot:
-the refusal reply tells you your own id, and the log line prints it too.
+Don't know your staff id? Put a placeholder in `allowUsers` and message the bot: the refusal
+reply tells you your own id, and the log line prints it too.
 
 ### 3. Wire up a spectator group
 
@@ -58,26 +62,59 @@ Add the bot to a group and @-mention it once. The bridge logs the conversation i
 [dingtalk] message from Alice in group cidXXXXXXXXXXXX=
 ```
 
-Put that id in `DINGTALK_MIRROR_CONVERSATIONS` and restart. The group now receives every
-question and answer, including runs you start from the terminal.
+Put that id in the config file's `mirrorConversations` and restart. The group now receives
+every question and answer, including runs you start from the terminal.
+
+## Running several bots
+
+One JSON file per bot; pick one at launch:
+
+```bash
+prime-agent --dingtalk-config ~/bots/team-a.json     # in ~/work/service-a
+prime-agent --dingtalk-config ~/bots/team-b.json     # in ~/work/service-b
+```
+
+Each session runs its own bot with its own allowlist and its own spectator groups.
+
+**The file wins over environment variables.** Choosing a bot is the whole point of naming a
+file, so a stale `DINGTALK_CLIENT_ID` left in a shell profile can never quietly connect the
+wrong bot with this bot's allowlist. Environment variables only fill in keys the file omits.
+
+### Where the config file comes from
+
+Checked in order; the first hit is used:
+
+1. `--dingtalk-config <path>` (relative paths resolve against the working directory)
+2. `DINGTALK_CONFIG=<path>`
+3. `<cwd>/.prime/agent/dingtalk.json` — per-project bot, no flag needed
+4. `~/.prime/agent/dingtalk.json` — your default bot
+
+A path named by the flag or `DINGTALK_CONFIG` must exist; a missing file there is an error
+rather than a silent fallback. The discovered defaults may be absent without complaint.
+
+With **no** config file and no `DINGTALK_*` variables, the extension stays completely silent,
+so it is safe to drop into `~/.prime/agent/extensions/` and have it load in every session.
 
 ## Configuration
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `DINGTALK_CLIENT_ID` | — | **Required.** The app's AppKey; also the Stream client id. |
-| `DINGTALK_CLIENT_SECRET` | — | **Required.** The app's AppSecret. |
-| `DINGTALK_ALLOW_USERS` | — | **Required.** Comma-separated staff ids allowed to drive the agent. |
-| `DINGTALK_MIRROR_CONVERSATIONS` | empty | Comma-separated group conversation ids that receive the mirror. |
-| `DINGTALK_GROUP_MODE` | `mirror` | `mirror` keeps groups read-only; `interactive` lets allowlisted users drive from a group. |
-| `DINGTALK_ROBOT_CODE` | `DINGTALK_CLIENT_ID` | Robot code for the proactive send APIs, when it differs from the AppKey. |
-| `DINGTALK_MIRROR_TOOLS` | `false` | Also broadcast each tool invocation. Noisy. |
-| `DINGTALK_MAX_CHARS` | `3500` | Split threshold for long answers. |
-| `DINGTALK_STREAMING_BEHAVIOR` | `followUp` | How a question is queued mid-run: `followUp` waits, `steer` redirects the running turn. |
-| `DINGTALK_PROGRESS_AFTER_MS` | `20000` | Send a "still working" note after this long. `0` disables it. |
-| `DINGTALK_NOTICE_COOLDOWN_MS` | `3600000` | Minimum gap between repeats of the same refusal notice in one conversation. |
-| `DINGTALK_CARD_TEMPLATE_ID` | unset | Enables AI-card streaming replies (see below). |
-| `DINGTALK_CARD_MARKDOWN_KEY` | `content` | Card template variable holding the markdown body. |
+| Config file key | Environment variable | Default | Purpose |
+|---|---|---|---|
+| `clientId` | `DINGTALK_CLIENT_ID` | — | **Required.** The app's AppKey; also the Stream client id. |
+| `clientSecret` | `DINGTALK_CLIENT_SECRET` | — | **Required.** The app's AppSecret. |
+| `allowUsers` | `DINGTALK_ALLOW_USERS` | — | **Required.** Staff ids allowed to drive the agent. |
+| `mirrorConversations` | `DINGTALK_MIRROR_CONVERSATIONS` | empty | Group conversation ids that receive the mirror. |
+| `groupMode` | `DINGTALK_GROUP_MODE` | `mirror` | `mirror` keeps groups read-only; `interactive` lets allowlisted users drive from a group. |
+| `robotCode` | `DINGTALK_ROBOT_CODE` | `clientId` | Robot code for the proactive send APIs, when it differs from the AppKey. |
+| `mirrorTools` | `DINGTALK_MIRROR_TOOLS` | `false` | Also broadcast each tool invocation. Noisy. |
+| `maxChars` | `DINGTALK_MAX_CHARS` | `3500` | Split threshold for long answers. |
+| `streamingBehavior` | `DINGTALK_STREAMING_BEHAVIOR` | `followUp` | How a question is queued mid-run: `followUp` waits, `steer` redirects the running turn. |
+| `progressAfterMs` | `DINGTALK_PROGRESS_AFTER_MS` | `20000` | Send a "still working" note after this long. `0` disables it. |
+| `noticeCooldownMs` | `DINGTALK_NOTICE_COOLDOWN_MS` | `3600000` | Minimum gap between repeats of the same refusal notice in one conversation. |
+| `cardTemplateId` | `DINGTALK_CARD_TEMPLATE_ID` | unset | Enables AI-card streaming replies (see below). |
+| `cardMarkdownKey` | `DINGTALK_CARD_MARKDOWN_KEY` | `content` | Card template variable holding the markdown body. |
+
+List values accept either an array or one comma-separated string. Unknown keys are reported as
+warnings rather than ignored, so a typo does not become a silently misbehaving bot.
 
 ## Chat commands
 
@@ -93,12 +130,16 @@ still work.
 
 By default a reply arrives as one message when the run finishes, because DingTalk cannot edit a
 message after it is sent. To get a live, typewriter-style reply instead, create an **AI 卡片**
-template in the developer console with a markdown variable, then set:
+template in the developer console with a markdown variable, then add to the config file:
 
-```bash
-export DINGTALK_CARD_TEMPLATE_ID=<template id>
-export DINGTALK_CARD_MARKDOWN_KEY=content   # must match the template variable
+```json
+{
+	"cardTemplateId": "<template id>",
+	"cardMarkdownKey": "content"
+}
 ```
+
+`cardMarkdownKey` must match the variable name in your template.
 
 The bridge then creates one card per run and streams the answer into it, throttled to roughly
 one update per 700 ms. If card creation or streaming fails, it falls back to a plain message —
@@ -130,5 +171,7 @@ far shorter than a real agent task.
 - Text messages only. Images, files, and voice are ignored with a log line.
 - Group replies @-mention the asker via the session webhook. Mention rendering through the
   proactive `groupMessages/send` path depends on your message template.
-- One agent session serves every conversation. For per-user isolated sessions, run a bridge
-  service against the SDK or `--mode rpc` instead of loading this extension.
+- One bot per session. Several bots means several `prime-agent` sessions, one config file each;
+  a single session does not multiplex bots.
+- One agent session serves every conversation of its bot. For per-user isolated sessions, run a
+  bridge service against the SDK or `--mode rpc` instead of loading this extension.
