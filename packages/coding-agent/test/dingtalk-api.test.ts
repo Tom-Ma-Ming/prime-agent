@@ -202,3 +202,92 @@ describe("DingTalkApi — AI cards", () => {
 		expect(streams[1].body).toMatchObject({ content: "final", isFinalize: true });
 	});
 });
+
+/**
+ * Screenshots are the one reply a markdown message cannot carry, and the session webhook has no
+ * image type at all, so images always take the proactive robot path after an upload.
+ */
+describe("image delivery", () => {
+	interface RawCall {
+		url: string;
+		body: unknown;
+		headers: Record<string, string>;
+	}
+
+	function rawRecorder(responder: (url: string) => { status?: number; body: unknown }) {
+		const calls: RawCall[] = [];
+		const fetchImpl: FetchLike = async (url, init) => {
+			calls.push({ url, body: init.body, headers: (init.headers ?? {}) as Record<string, string> });
+			const { status = 200, body } = responder(url);
+			return new Response(JSON.stringify(body), { status });
+		};
+		return { calls, fetchImpl };
+	}
+
+	const uploaded = { errcode: 0, errmsg: "ok", media_id: "@lALPtest", type: "image" };
+
+	function respond(url: string) {
+		if (url.includes("oauth2/accessToken")) return { body: tokenBody };
+		if (url.includes("media/upload")) return { body: uploaded };
+		return { body: {} };
+	}
+
+	it("uploads bytes as multipart and returns the media id", async () => {
+		const { calls, fetchImpl } = rawRecorder(respond);
+		const api = new DingTalkApi(config(), fetchImpl);
+
+		const mediaId = await api.uploadImage(new Uint8Array([1, 2, 3]), "shot.png");
+
+		expect(mediaId).toBe("@lALPtest");
+		const upload = calls.find((call) => call.url.includes("media/upload"));
+		expect(upload).toBeDefined();
+		// The token rides in the query string here: this endpoint predates the v1.0 header auth.
+		expect(upload?.url).toContain("access_token=token-abc");
+		expect(upload?.body).toBeInstanceOf(FormData);
+	});
+
+	it("treats a non-zero errcode as a failure even though the HTTP status is 200", async () => {
+		const { fetchImpl } = rawRecorder((url) =>
+			url.includes("oauth2/accessToken")
+				? { body: tokenBody }
+				: { body: { errcode: 40035, errmsg: "invalid media" } },
+		);
+		const api = new DingTalkApi(config(), fetchImpl);
+
+		await expect(api.uploadImage(new Uint8Array([1]), "shot.png")).rejects.toBeInstanceOf(DingTalkApiError);
+	});
+
+	it("sends an image to a private chat with the asker's staff id", async () => {
+		const { calls, fetchImpl } = rawRecorder(respond);
+		const api = new DingTalkApi(config(), fetchImpl);
+		const target: ReplyTarget = { conversationId: "conv-1", kind: "private", askerStaffId: "staff-alice" };
+
+		await api.sendImageToTarget(target, "@lALPtest");
+
+		const send = calls.find((call) => call.url.includes("oToMessages/batchSend"));
+		const body = JSON.parse(String(send?.body));
+		expect(body).toMatchObject({ robotCode: "robot-1", userIds: ["staff-alice"], msgKey: "sampleImageMsg" });
+		expect(JSON.parse(body.msgParam)).toEqual({ photoURL: "@lALPtest" });
+	});
+
+	it("sends an image to a group by conversation id", async () => {
+		const { calls, fetchImpl } = rawRecorder(respond);
+		const api = new DingTalkApi(config(), fetchImpl);
+		const target: ReplyTarget = { conversationId: "cid-group", kind: "group" };
+
+		await api.sendImageToTarget(target, "@lALPtest");
+
+		const send = calls.find((call) => call.url.includes("groupMessages/send"));
+		const body = JSON.parse(String(send?.body));
+		expect(body).toMatchObject({ openConversationId: "cid-group", msgKey: "sampleImageMsg" });
+	});
+
+	it("refuses a private target with no staff id rather than sending nowhere", async () => {
+		const { fetchImpl } = rawRecorder(respond);
+		const api = new DingTalkApi(config(), fetchImpl);
+
+		await expect(
+			api.sendImageToTarget({ conversationId: "conv-1", kind: "private" }, "@lALPtest"),
+		).rejects.toBeInstanceOf(DingTalkApiError);
+	});
+});

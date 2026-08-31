@@ -186,16 +186,60 @@ describe("mirrorTargets", () => {
 
 describe("parseBridgeCommand", () => {
 	it("recognizes stop and status in both spellings", () => {
-		expect(parseBridgeCommand("/stop")).toBe("stop");
-		expect(parseBridgeCommand(" /abort ")).toBe("stop");
-		expect(parseBridgeCommand("停")).toBe("stop");
-		expect(parseBridgeCommand("/status")).toBe("status");
-		expect(parseBridgeCommand("状态")).toBe("status");
+		expect(parseBridgeCommand("/stop")).toEqual({ kind: "stop" });
+		expect(parseBridgeCommand(" /abort ")).toEqual({ kind: "stop" });
+		expect(parseBridgeCommand("停")).toEqual({ kind: "stop" });
+		expect(parseBridgeCommand("/status")).toEqual({ kind: "status" });
+		expect(parseBridgeCommand("状态")).toEqual({ kind: "status" });
 	});
 
 	it("leaves ordinary prompts alone", () => {
 		expect(parseBridgeCommand("stop the deploy")).toBeUndefined();
 		expect(parseBridgeCommand("/skill:web-search prime agent")).toBeUndefined();
+	});
+
+	// `/model` is a terminal-only command: it never reached the bridge, so it went to the LLM
+	// as a prompt and the model silently stayed the same.
+	it("recognizes the model command with and without a query", () => {
+		expect(parseBridgeCommand("/model")).toEqual({ kind: "model" });
+		expect(parseBridgeCommand("/models")).toEqual({ kind: "model" });
+		expect(parseBridgeCommand("模型")).toEqual({ kind: "model" });
+		expect(parseBridgeCommand("/model sonnet")).toEqual({ kind: "model", query: "sonnet" });
+		expect(parseBridgeCommand("  /model   anthropic/claude-opus-5  ")).toEqual({
+			kind: "model",
+			query: "anthropic/claude-opus-5",
+		});
+		expect(parseBridgeCommand("模型 opus")).toEqual({ kind: "model", query: "opus" });
+	});
+
+	it("keeps the query's original case so model ids match", () => {
+		expect(parseBridgeCommand("/model GPT-5")).toEqual({ kind: "model", query: "GPT-5" });
+	});
+
+	it("does not mistake a prompt that merely mentions a model for the command", () => {
+		expect(parseBridgeCommand("which model are you")).toBeUndefined();
+		expect(parseBridgeCommand("/modelling the data")).toBeUndefined();
+	});
+
+	it("recognizes the rest of the terminal-only commands", () => {
+		expect(parseBridgeCommand("/thinking")).toEqual({ kind: "thinking" });
+		expect(parseBridgeCommand("/thinking high")).toEqual({ kind: "thinking", query: "high" });
+		expect(parseBridgeCommand("思考 max")).toEqual({ kind: "thinking", query: "max" });
+		expect(parseBridgeCommand("/context")).toEqual({ kind: "context" });
+		expect(parseBridgeCommand("上下文")).toEqual({ kind: "context" });
+		expect(parseBridgeCommand("/compact")).toEqual({ kind: "compact" });
+		expect(parseBridgeCommand("/compact 保留部署细节")).toEqual({ kind: "compact", query: "保留部署细节" });
+		expect(parseBridgeCommand("/tools")).toEqual({ kind: "tools" });
+		expect(parseBridgeCommand("/help")).toEqual({ kind: "help" });
+		expect(parseBridgeCommand("/commands")).toEqual({ kind: "help" });
+	});
+
+	// Only the argument-taking commands may carry a tail. Otherwise "/status 一下部署" would be
+	// swallowed as a command instead of reaching the agent as the question it is.
+	it("requires an exact match for commands that take no argument", () => {
+		expect(parseBridgeCommand("/status now")).toBeUndefined();
+		expect(parseBridgeCommand("/tools list them all")).toBeUndefined();
+		expect(parseBridgeCommand("停 一下部署")).toBeUndefined();
 	});
 });
 

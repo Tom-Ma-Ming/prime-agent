@@ -59,12 +59,22 @@ interface HttpCall {
 function setupFetch() {
 	const calls: HttpCall[] = [];
 	const fetchImpl = vi.fn(async (url: string, init: RequestInit) => {
-		calls.push({ url, body: JSON.parse(String(init.body)) });
+		// The media upload posts FormData, so a body is not always JSON.
+		let body: any = init.body;
+		if (typeof body === "string") {
+			try {
+				body = JSON.parse(body);
+			} catch {}
+		}
+		calls.push({ url, body });
 		if (url.includes("gateway/connections/open")) {
 			return new Response(JSON.stringify({ endpoint: "wss://stream.invalid/ws", ticket: "ticket-1" }));
 		}
 		if (url.includes("oauth2/accessToken")) {
 			return new Response(JSON.stringify({ accessToken: "token-abc", expireIn: 7200 }));
+		}
+		if (url.includes("media/upload")) {
+			return new Response(JSON.stringify({ errcode: 0, errmsg: "ok", media_id: "@lATestMedia" }));
 		}
 		return new Response(JSON.stringify({}));
 	});
@@ -76,6 +86,8 @@ type Handler = (event: any, ctx: ExtensionContext) => unknown;
 function setupExtension(flags: Record<string, string> = {}) {
 	const handlers = new Map<string, Handler[]>();
 	const sendUserMessage = vi.fn();
+	const setModel = vi.fn(async () => true);
+	let thinkingLevel = "medium";
 	const api = {
 		on: (event: string, handler: Handler) => {
 			const existing = handlers.get(event) ?? [];
@@ -84,6 +96,13 @@ function setupExtension(flags: Record<string, string> = {}) {
 		},
 		sendUserMessage,
 		sendMessage: vi.fn(),
+		setModel,
+		getThinkingLevel: () => thinkingLevel,
+		setThinkingLevel: (level: string) => {
+			thinkingLevel = level;
+		},
+		getActiveTools: () => ["bash", "read"],
+		getCommands: () => [{ name: "compact", description: "Compact the context" }],
 		registerCommand: vi.fn(),
 		registerTool: vi.fn(),
 		registerFlag: vi.fn(),
@@ -92,7 +111,14 @@ function setupExtension(flags: Record<string, string> = {}) {
 		exec: vi.fn(async () => ({ stdout: "", stderr: "", code: 0, killed: false })),
 	} as unknown as ExtensionAPI;
 
+	const availableModels = [
+		{ id: "claude-opus-5", name: "Claude Opus 5", provider: "anthropic" },
+		{ id: "claude-sonnet-5", name: "Claude Sonnet 5", provider: "anthropic" },
+		{ id: "gpt-5", name: "GPT-5", provider: "openai" },
+	];
+
 	const abort = vi.fn(async () => {});
+	const compact = vi.fn((options?: { onComplete?: (result: unknown) => void }) => options?.onComplete?.({}));
 	let idle = true;
 	const ctx = {
 		hasUI: false,
@@ -102,6 +128,10 @@ function setupExtension(flags: Record<string, string> = {}) {
 		abort,
 		hasPendingMessages: () => false,
 		shutdown: vi.fn(),
+		model: availableModels[0],
+		modelRegistry: { getAvailable: () => availableModels },
+		getContextUsage: () => ({ tokens: 12_345, contextWindow: 200_000, percent: 6 }),
+		compact,
 	} as unknown as ExtensionContext;
 
 	const fire = async (event: string, payload: Record<string, unknown>) => {
@@ -109,7 +139,18 @@ function setupExtension(flags: Record<string, string> = {}) {
 	};
 
 	dingTalkExtension(api);
-	return { api, ctx, fire, sendUserMessage, abort, setIdle: (value: boolean) => (idle = value) };
+	return {
+		api,
+		ctx,
+		fire,
+		sendUserMessage,
+		abort,
+		setModel,
+		compact,
+		availableModels,
+		getThinkingLevel: () => thinkingLevel,
+		setIdle: (value: boolean) => (idle = value),
+	};
 }
 
 function botMessage(overrides: Record<string, unknown> = {}) {
@@ -132,6 +173,10 @@ function groupSends(calls: HttpCall[], conversationId: string) {
 	return calls.filter(
 		(call) => call.url.includes("groupMessages/send") && call.body.openConversationId === conversationId,
 	);
+}
+
+function userSends(calls: HttpCall[]) {
+	return calls.filter((call) => call.url.includes("oToMessages/batchSend"));
 }
 
 function webhookSends(calls: HttpCall[]) {
@@ -182,6 +227,9 @@ describe("dingtalk bridge extension", () => {
 	async function start(flags: Record<string, string> = {}) {
 		const harness = setupExtension(flags);
 		await harness.fire("session_start", {});
+		// The stream client no longer blocks session start on the gateway request, so give that
+		// request a turn to settle before reaching for the socket it creates.
+		await new Promise((resolve) => setTimeout(resolve, 0));
 		const socket = FakeSocket.instances[0];
 		expect(socket).toBeDefined();
 		socket.emit("open", {});
@@ -345,6 +393,239 @@ describe("dingtalk bridge extension", () => {
 
 			await vi.waitFor(() => expect(webhookSends(calls)).toHaveLength(1));
 			expect(textOf(webhookSends(calls)[0])).toContain("空闲");
+		});
+
+		// Switching models used to require walking to the terminal: `/model` reached the agent as
+		// a prompt, so the model answered a question about itself and nothing changed.
+		it("reports the current model on /model without switching", async () => {
+			const { socket, setModel } = await start();
+			socket.deliverBotMessage(botMessage({ text: { content: "/model" } }));
+
+			await vi.waitFor(() => expect(webhookSends(calls)).toHaveLength(1));
+			expect(textOf(webhookSends(calls)[0])).toContain("claude-opus-5");
+			expect(setModel).not.toHaveBeenCalled();
+		});
+
+		it("switches to the only model matching the query", async () => {
+			const { socket, setModel, availableModels, sendUserMessage } = await start();
+			socket.deliverBotMessage(botMessage({ text: { content: "/model sonnet" } }));
+
+			await vi.waitFor(() => expect(setModel).toHaveBeenCalledWith(availableModels[1]));
+			expect(sendUserMessage).not.toHaveBeenCalled();
+			expect(textOf(webhookSends(calls)[0])).toContain("claude-sonnet-5");
+		});
+
+		it("lists the candidates instead of guessing when a query is ambiguous", async () => {
+			const { socket, setModel } = await start();
+			socket.deliverBotMessage(botMessage({ text: { content: "/model claude" } }));
+
+			await vi.waitFor(() => expect(webhookSends(calls)).toHaveLength(1));
+			const text = textOf(webhookSends(calls)[0]);
+			expect(text).toContain("claude-opus-5");
+			expect(text).toContain("claude-sonnet-5");
+			expect(setModel).not.toHaveBeenCalled();
+		});
+
+		it("says so when nothing matches", async () => {
+			const { socket, setModel } = await start();
+			socket.deliverBotMessage(botMessage({ text: { content: "/model llama" } }));
+
+			await vi.waitFor(() => expect(webhookSends(calls)).toHaveLength(1));
+			expect(textOf(webhookSends(calls)[0])).toContain("没有匹配");
+			expect(setModel).not.toHaveBeenCalled();
+		});
+
+		it("reports the failure when the model has no usable credentials", async () => {
+			const harness = await start();
+			harness.setModel.mockResolvedValueOnce(false);
+			harness.socket.deliverBotMessage(botMessage({ text: { content: "/model gpt-5" } }));
+
+			await vi.waitFor(() => expect(webhookSends(calls)).toHaveLength(1));
+			expect(textOf(webhookSends(calls)[0])).toContain("切换失败");
+		});
+
+		it("switches the thinking level and reads back what was applied", async () => {
+			const { socket, getThinkingLevel } = await start();
+			socket.deliverBotMessage(botMessage({ text: { content: "/thinking high" } }));
+
+			await vi.waitFor(() => expect(getThinkingLevel()).toBe("high"));
+			expect(textOf(webhookSends(calls)[0])).toContain("high");
+		});
+
+		it("refuses an unknown thinking level instead of guessing", async () => {
+			const { socket, getThinkingLevel } = await start();
+			socket.deliverBotMessage(botMessage({ text: { content: "/thinking turbo" } }));
+
+			await vi.waitFor(() => expect(webhookSends(calls)).toHaveLength(1));
+			expect(textOf(webhookSends(calls)[0])).toContain("不是有效等级");
+			expect(getThinkingLevel()).toBe("medium");
+		});
+
+		it("reports context usage on /context", async () => {
+			const { socket } = await start();
+			socket.deliverBotMessage(botMessage({ text: { content: "/context" } }));
+
+			await vi.waitFor(() => expect(webhookSends(calls)).toHaveLength(1));
+			expect(textOf(webhookSends(calls)[0])).toContain("12,345");
+		});
+
+		it("passes custom instructions through to compaction", async () => {
+			const { socket, compact } = await start();
+			socket.deliverBotMessage(botMessage({ text: { content: "/compact 保留部署细节" } }));
+
+			await vi.waitFor(() => expect(compact).toHaveBeenCalled());
+			expect(compact.mock.calls[0][0]).toMatchObject({ customInstructions: "保留部署细节" });
+		});
+
+		it("lists the active tools on /tools", async () => {
+			const { socket } = await start();
+			socket.deliverBotMessage(botMessage({ text: { content: "/tools" } }));
+
+			await vi.waitFor(() => expect(webhookSends(calls)).toHaveLength(1));
+			expect(textOf(webhookSends(calls)[0])).toContain("bash");
+		});
+
+		it("lists both bridge and session commands on /help", async () => {
+			const { socket } = await start();
+			socket.deliverBotMessage(botMessage({ text: { content: "/help" } }));
+
+			await vi.waitFor(() => expect(webhookSends(calls)).toHaveLength(1));
+			const text = textOf(webhookSends(calls)[0]);
+			expect(text).toContain("/model");
+			expect(text).toContain("compact");
+		});
+	});
+
+	// A skill that verifies a page can screenshot it, but markdown cannot carry the picture and a
+	// chat cannot open a local path, so without this tool the screenshot never leaves the machine.
+	describe("image tool", () => {
+		const PNG = Buffer.from(
+			"iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAHElEQVQI12P8z8Dwn4EIwESMolGFowpHFQ4dhQCK0wMBs1a3TQAAAABJRU5ErkJggg==",
+			"base64",
+		);
+
+		function registeredTool(harness: { api: ExtensionAPI }) {
+			const calls = (harness.api.registerTool as unknown as { mock: { calls: any[][] } }).mock.calls;
+			return calls.map((call) => call[0]).find((tool) => tool.name === "dingtalk_send_image");
+		}
+
+		it("is not registered when no bot is configured", async () => {
+			const harness = setupExtension();
+			delete process.env.DINGTALK_CLIENT_ID;
+			delete process.env.DINGTALK_CLIENT_SECRET;
+			delete process.env.DINGTALK_ALLOW_USERS;
+			await harness.fire("session_start", {});
+
+			expect(registeredTool(harness)).toBeUndefined();
+		});
+
+		it("uploads the file and delivers it to the asker", async () => {
+			const harness = await start();
+			const shot = join(sandboxDir, "shot.png");
+			writeFileSync(shot, PNG);
+
+			// A queued asker is what gives the picture somewhere to go.
+			harness.socket.deliverBotMessage(botMessage({ text: { content: "看看页面" } }));
+			await vi.waitFor(() => expect(harness.sendUserMessage).toHaveBeenCalled());
+
+			const tool = registeredTool(harness);
+			expect(tool).toBeDefined();
+			const result = await tool.execute("call-1", { path: shot });
+
+			expect(calls.some((call) => call.url.includes("media/upload"))).toBe(true);
+			const send = calls.find((call) => call.url.includes("oToMessages/batchSend"));
+			expect(send?.body).toMatchObject({ msgKey: "sampleImageMsg" });
+			expect(JSON.parse(send?.body.msgParam)).toEqual({ photoURL: "@lATestMedia" });
+			expect(result.content[0].text).toContain("shot.png");
+		});
+
+		it("refuses a path that does not exist instead of reporting success", async () => {
+			const harness = await start();
+			harness.socket.deliverBotMessage(botMessage({ text: { content: "看看页面" } }));
+			await vi.waitFor(() => expect(harness.sendUserMessage).toHaveBeenCalled());
+
+			const tool = registeredTool(harness);
+			await expect(tool.execute("call-1", { path: join(sandboxDir, "missing.png") })).rejects.toThrow(
+				/Could not read/,
+			);
+		});
+
+		// A terminal run is watched in the terminal. Pushing its screenshots into a spectator
+		// group would be noise nobody asked for, so the groups are opt-in.
+		it("sends nothing when the run came from the terminal", async () => {
+			const harness = await start();
+			const shot = join(sandboxDir, "local.png");
+			writeFileSync(shot, PNG);
+
+			const result = await registeredTool(harness).execute("call-1", { path: shot });
+
+			expect(groupSends(calls, "group-watch")).toHaveLength(0);
+			expect(userSends(calls)).toHaveLength(0);
+			expect(result.content[0].text).toContain("未推送");
+		});
+
+		it("reaches the spectator groups only when explicitly asked", async () => {
+			const harness = await start();
+			const shot = join(sandboxDir, "local.png");
+			writeFileSync(shot, PNG);
+
+			await registeredTool(harness).execute("call-1", { path: shot, alsoGroups: true });
+
+			expect(groupSends(calls, "group-watch").length).toBeGreaterThan(0);
+		});
+
+		it("still sends to the asker without asking for groups", async () => {
+			const harness = await start();
+			const shot = join(sandboxDir, "asked.png");
+			writeFileSync(shot, PNG);
+
+			harness.socket.deliverBotMessage(botMessage({ text: { content: "看看页面" } }));
+			await vi.waitFor(() => expect(harness.sendUserMessage).toHaveBeenCalled());
+
+			await registeredTool(harness).execute("call-1", { path: shot });
+
+			expect(userSends(calls).some((call) => call.body.msgKey === "sampleImageMsg")).toBe(true);
+			// The question itself is still mirrored to the group; only the *image* stays private.
+			expect(groupSends(calls, "group-watch").filter((call) => call.body.msgKey === "sampleImageMsg")).toHaveLength(
+				0,
+			);
+		});
+	});
+
+	// The daemon replays each worker's --dingtalk-config on revival, so a second session for the
+	// same bot is the default outcome of relaunching, not a rare mistake.
+	describe("single instance per bot", () => {
+		it("declines to connect when another live session already runs the bot", async () => {
+			await start();
+			expect(FakeSocket.instances).toHaveLength(1);
+
+			const second = setupExtension();
+			await second.fire("session_start", {});
+			await new Promise((resolve) => setTimeout(resolve, 0));
+
+			expect(FakeSocket.instances).toHaveLength(1);
+		});
+
+		it("lets the next session take over once the first has shut down", async () => {
+			const first = await start();
+			await first.fire("session_shutdown", {});
+
+			const second = setupExtension();
+			await second.fire("session_start", {});
+			await new Promise((resolve) => setTimeout(resolve, 0));
+
+			expect(FakeSocket.instances).toHaveLength(2);
+		});
+
+		it("keeps two different bots independent", async () => {
+			await start();
+
+			vi.stubEnv("DINGTALK_CLIENT_ID", "other-app-key");
+			const second = setupExtension();
+			await second.fire("session_start", {});
+			await new Promise((resolve) => setTimeout(resolve, 0));
+
+			expect(FakeSocket.instances).toHaveLength(2);
 		});
 	});
 

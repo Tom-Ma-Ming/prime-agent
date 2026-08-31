@@ -7,6 +7,7 @@
  * Uses the global `WebSocket` and `fetch` from Node >= 22, so the extension needs no dependencies.
  */
 
+import { randomUUID } from "node:crypto";
 import type { DingTalkConfig } from "./config.js";
 import type { ConversationKind, InboundMessage } from "./types.js";
 
@@ -15,6 +16,26 @@ const BOT_MESSAGE_TOPIC = "/v1.0/im/bot/messages/get";
 
 const RECONNECT_MIN_MS = 1_000;
 const RECONNECT_MAX_MS = 60_000;
+
+/**
+ * How often to put a byte on an otherwise idle socket.
+ *
+ * The gateway health-checks with its own ping, but a quiet conversation can leave the socket
+ * carrying no traffic for minutes, and a NAT or proxy in the path reaps an idle TCP flow long
+ * before either end notices — typically at 300s, and the drop arrives as a 1006 with no close
+ * handshake rather than the `disconnect` frame the protocol promises. Measured on a TUN-mode
+ * proxy: an idle socket died at 278s, while the same socket kept alive at this interval was
+ * still up past 400s. Well under any common idle timeout, and one small frame per interval.
+ */
+const KEEPALIVE_MS = 30_000;
+
+/**
+ * How long one connection attempt may take before it is abandoned and retried.
+ *
+ * Generous enough for a slow gateway — the observed handshake takes 2–8s — while still bounding
+ * the case that matters: an attempt that hangs forever and takes the whole reconnect loop with it.
+ */
+const CONNECT_TIMEOUT_MS = 30_000;
 
 interface StreamFrame {
 	type?: string;
@@ -61,15 +82,23 @@ export class DingTalkStreamClient {
 	private stopped = false;
 	private attempt = 0;
 	private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+	private keepaliveTimer: ReturnType<typeof setInterval> | undefined;
 
 	constructor(
 		private readonly config: DingTalkConfig,
 		private readonly handlers: StreamHandlers,
 	) {}
 
+	/**
+	 * Begin connecting. Deliberately does not wait for the socket.
+	 *
+	 * The caller is `session_start`; blocking it on a gateway round trip delays the whole agent
+	 * by seconds on a good day, and by however long the network hangs on a bad one. Failures
+	 * reschedule themselves, so there is nothing here worth awaiting.
+	 */
 	async start(): Promise<void> {
 		this.stopped = false;
-		await this.connect();
+		void this.connect();
 	}
 
 	stop(): void {
@@ -78,24 +107,100 @@ export class DingTalkStreamClient {
 			clearTimeout(this.reconnectTimer);
 			this.reconnectTimer = undefined;
 		}
+		this.stopKeepalive();
 		this.socket?.close();
 		this.socket = undefined;
+	}
+
+	private stopKeepalive(): void {
+		if (this.keepaliveTimer) {
+			clearInterval(this.keepaliveTimer);
+			this.keepaliveTimer = undefined;
+		}
+	}
+
+	/**
+	 * Keep the socket's TCP flow warm for as long as it is the live one.
+	 *
+	 * The gateway tolerates an unsolicited ack envelope, which is the only client-to-server frame
+	 * the protocol defines, so this borrows that shape rather than inventing one.
+	 */
+	private startKeepalive(socket: WebSocket): void {
+		this.stopKeepalive();
+		this.keepaliveTimer = setInterval(() => {
+			if (this.stopped || this.socket !== socket || socket.readyState !== WebSocket.OPEN) return;
+			try {
+				socket.send(
+					JSON.stringify({
+						code: 200,
+						headers: { contentType: "application/json", messageId: randomUUID() },
+						message: "OK",
+						data: "{}",
+					}),
+				);
+			} catch (error) {
+				// A send that throws means the socket is already gone; let the close path reconnect.
+				this.log("warn", `keepalive failed: ${error instanceof Error ? error.message : String(error)}`);
+				socket.close();
+			}
+		}, KEEPALIVE_MS);
 	}
 
 	private log(level: "info" | "warn" | "error", message: string): void {
 		this.handlers.onLog?.(level, message);
 	}
 
+	/**
+	 * Open one connection, guaranteeing exactly one outcome: a live socket, or a scheduled retry.
+	 *
+	 * Every step here can hang instead of failing. `fetch` has no default timeout in Node, and a
+	 * WebSocket handshake against a stale route may never produce `open` or `close` — both are
+	 * ordinary after a laptop sleeps or the network changes. Without a watchdog the attempt
+	 * simply never finishes: nothing schedules another retry, and the bridge stays silently dead
+	 * until someone restarts the agent.
+	 */
 	private async connect(): Promise<void> {
 		if (this.stopped) return;
+
+		const controller = new AbortController();
+		let settled = false;
+		let opened = false;
+		let pending: WebSocket | undefined;
+
+		const abandon = (reason: string) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(watchdog);
+			controller.abort();
+			if (pending) {
+				// Detach first, so this socket's own close cannot queue a second retry.
+				if (this.socket === pending) this.socket = undefined;
+				try {
+					pending.close();
+				} catch {
+					// Already dead; the retry below is what matters.
+				}
+			}
+			this.scheduleReconnect(reason);
+		};
+
+		const watchdog = setTimeout(() => abandon(`connect stalled for ${CONNECT_TIMEOUT_MS}ms`), CONNECT_TIMEOUT_MS);
+
 		try {
-			const { endpoint, ticket } = await this.openConnection();
+			const { endpoint, ticket } = await this.openConnection(controller.signal);
+			if (this.stopped || settled) return;
+
 			const url = `${endpoint}?ticket=${encodeURIComponent(ticket)}`;
 			const socket = new WebSocket(url);
+			pending = socket;
 			this.socket = socket;
 
 			socket.addEventListener("open", () => {
+				opened = true;
+				settled = true;
+				clearTimeout(watchdog);
 				this.attempt = 0;
+				this.startKeepalive(socket);
 				this.log("info", "DingTalk stream connected");
 			});
 			socket.addEventListener("message", (event) => {
@@ -105,17 +210,26 @@ export class DingTalkStreamClient {
 				this.log("warn", "DingTalk stream socket error");
 			});
 			socket.addEventListener("close", () => {
-				if (this.socket === socket) this.socket = undefined;
-				this.scheduleReconnect("socket closed");
+				if (this.socket === socket) {
+					this.socket = undefined;
+					this.stopKeepalive();
+				}
+				if (opened) {
+					clearTimeout(watchdog);
+					this.scheduleReconnect("socket closed");
+				} else {
+					abandon("socket closed before opening");
+				}
 			});
 		} catch (error) {
-			this.scheduleReconnect(error instanceof Error ? error.message : String(error));
+			abandon(error instanceof Error ? error.message : String(error));
 		}
 	}
 
-	private async openConnection(): Promise<{ endpoint: string; ticket: string }> {
+	private async openConnection(signal?: AbortSignal): Promise<{ endpoint: string; ticket: string }> {
 		const response = await fetch(GATEWAY_URL, {
 			method: "POST",
+			signal,
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({
 				clientId: this.config.clientId,
