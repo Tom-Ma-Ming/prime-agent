@@ -9,7 +9,7 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { readFile, stat } from "node:fs/promises";
+import { stat } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { type Api, getLogger, type Model } from "@earendil-works/pi-ai";
@@ -39,7 +39,6 @@ import {
 	type AgentSessionMessageSender,
 	agentFamilyRelationship,
 	assertAgentFamilyReach,
-	assertAgentMessageQueueCapacity,
 	assertAgentSessionNameAvailable,
 	assertDirectAgentMessageTarget,
 	buildAgentFamilyRoster,
@@ -51,7 +50,6 @@ import {
 	DEFAULT_AGENT_MESSAGE_RATE_LIMIT_CAPACITY,
 	DEFAULT_AGENT_MESSAGE_RATE_LIMIT_REFILL_MS,
 	formatAgentSessionNameUnavailable,
-	isAgentSessionMessagePrompt,
 	normalizeAgentSessionMessage,
 	sessionNameReservationKey,
 } from "../../core/agent-messages.js";
@@ -66,7 +64,7 @@ import {
 	normalizeObserveLimit,
 	normalizeObserveMaxChars,
 } from "../../core/agent-observe.js";
-import { type AgentSession, type PromptOptions, rlmChildLabel } from "../../core/agent-session.js";
+import { type PromptOptions, rlmChildLabel } from "../../core/agent-session.js";
 import { type AgentSessionRuntimeConfig, mergeAgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import {
 	type AgentSessionRuntime,
@@ -195,9 +193,11 @@ import {
 import { MutationDrainLatch } from "./mutation-drain-latch.js";
 import {
 	createRlmLedgerRegistrySeedSource,
+	type LegacyRlmSubagentRegistryEntry,
 	type RlmLedgerDeleteReason,
 	type RlmLedgerEdge,
 	RlmSpawnLedger,
+	readLegacyRlmSubagentRegistry as readLegacyRlmSubagentRegistryFile,
 } from "./rlm-ledger.js";
 import {
 	readRlmSubagentDisplayEntry,
@@ -276,16 +276,20 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"get_state",
 	"get_connection_state",
 	"get_messages",
+	"get_rlm_children",
 	"get_session_stats",
 	"get_context_tree",
 	"get_commands",
 	"get_resource_snapshot",
+	"replace_acp_mcp_servers",
 	"get_model_catalog",
 	"get_available_models",
 	"get_queue",
 	"mutate_queued_message",
 	"clear_queue",
 	"abort_and_clear_queue",
+	"acquire_session_input_pause",
+	"release_session_input_pause",
 	"cron_list",
 	"heartbeats_list",
 	"heartbeat_manage",
@@ -401,17 +405,6 @@ interface PassiveRlmSubagentEntry {
 	createdAt: number;
 }
 
-/**
- * Legacy per-parent `rlm-subagents.jsonl` entry shape, exactly as the daemon
- * wrote it before the spawn ledger became topology authority. Read-only:
- * registries are consumed only as the ledger seed source and as fallback
- * hydration metadata for pre-ledger children without a display file.
- */
-interface LegacyRlmSubagentRegistryEntry extends PassiveRlmSubagentEntry {
-	type: "rlm_subagent";
-	updatedAt: string;
-}
-
 /** Spread-ready optional metadata fields shared by display files and legacy registry entries. */
 function rlmSubagentMetadataFields(source: {
 	rlmMaxDepth?: number;
@@ -453,6 +446,14 @@ export class AgentDaemon {
 	private server?: Server;
 	private shuttingDown = false;
 	private readonly updateRestartQueuePauses = new Map<string, { release(): void }>();
+	private readonly sessionInputPauses = new Map<
+		string,
+		{ activeSessionId: string; owner: DaemonSocketClient; leaseKey: string; pause: { release(): void } }
+	>();
+	private readonly acpMcpOwners = new Map<
+		string,
+		{ client: DaemonSocketClient; ownerId: string; serverNames: string[]; release?: Promise<void> }
+	>();
 	private readonly mutationDrain = new MutationDrainLatch();
 	private updateRestart?: {
 		id: symbol;
@@ -514,13 +515,6 @@ export class AgentDaemon {
 	private readonly agentDir: string;
 	private readonly cronScheduler: AgentCronScheduler;
 	private readonly agentMessageRateLimiter = new AgentSessionMessageRateLimiter();
-	private readonly remoteAgentPeers = new Map<string, AgentSessionMessageAgentSummary>();
-	private readonly agentMessagePendingReservations = new Map<string, number>();
-	private readonly agentMessageTargetLocks = new Map<string, Promise<void>>();
-	private readonly agentMessageAcceptingTargets = new Set<string>();
-	// Refcount of prompts in preflight (accepted but not yet streaming); >0 makes
-	// concurrent agent messages queue instead of racing agent.prompt.
-	private readonly agentMessagePreparingTargets = new Map<string, number>();
 	// Sessions inserted into `sessions` but still awaiting extension binding;
 	// visible to host controllers during bind, excluded from targeting.
 	private readonly bindingSessions = new Set<string>();
@@ -954,50 +948,14 @@ export class AgentDaemon {
 		return join(getSessionArtifactPathForFile(parentSessionFile, parentSessionId), RLM_SUBAGENT_REGISTRY_FILE);
 	}
 
-	private async readLegacyRlmSubagentRegistry(
+	private readLegacyRlmSubagentRegistry(
 		path: string,
 		throwOnReadError = false,
 	): Promise<LegacyRlmSubagentRegistryEntry[]> {
-		let lines: string[];
-		try {
-			lines = (await readFile(path, "utf8")).split(/\r?\n/);
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-				this.log(`failed to read RLM subagent registry: ${error instanceof Error ? error.message : String(error)}`);
-				if (throwOnReadError) {
-					throw error;
-				}
-			}
-			return [];
-		}
-		const latest = new Map<string, LegacyRlmSubagentRegistryEntry>();
-		for (const line of lines) {
-			const trimmed = line.trim();
-			if (!trimmed) {
-				continue;
-			}
-			try {
-				const entry = JSON.parse(trimmed) as Partial<LegacyRlmSubagentRegistryEntry>;
-				if (
-					entry.type !== "rlm_subagent" ||
-					typeof entry.childId !== "string" ||
-					typeof entry.sessionName !== "string" ||
-					typeof entry.sessionDir !== "string" ||
-					typeof entry.sessionFile !== "string" ||
-					(entry.status !== "running" && entry.status !== "completed" && entry.status !== "deleted") ||
-					(entry.rlmDepth !== undefined && (!Number.isSafeInteger(entry.rlmDepth) || entry.rlmDepth < 0)) ||
-					(entry.rlmMaxDepth !== undefined && (!Number.isSafeInteger(entry.rlmMaxDepth) || entry.rlmMaxDepth < 0))
-				) {
-					continue;
-				}
-				latest.set(entry.childId, entry as LegacyRlmSubagentRegistryEntry);
-			} catch (error) {
-				this.log(
-					`ignored malformed RLM subagent registry entry: ${error instanceof Error ? error.message : String(error)}`,
-				);
-			}
-		}
-		return [...latest.values()];
+		return readLegacyRlmSubagentRegistryFile(path, {
+			throwOnReadError,
+			log: (message) => this.log(message),
+		});
 	}
 
 	/**
@@ -1480,6 +1438,7 @@ export class AgentDaemon {
 	}
 
 	private refreshReplacedSessionState(state: ActiveSessionState): void {
+		this.acpMcpOwners?.delete(state.activeSessionId);
 		for (const client of state.clients) {
 			this.abortSideQuestionsFor(client, state.activeSessionId);
 		}
@@ -1773,17 +1732,10 @@ export class AgentDaemon {
 			return "skipped";
 		}
 		const session = state.runtime.session;
-		const isAgentMessagePromptInProgress =
-			this.agentMessageAcceptingTargets.has(state.activeSessionId) ||
-			this.agentMessagePreparingTargets.has(state.activeSessionId);
-		if (isHeartbeatCronJob(runnableJob) && isAgentMessagePromptInProgress) {
-			return "skipped";
-		}
 		if (shouldDeferHeartbeatCronJob(runnableJob, session)) {
 			return "skipped";
 		}
 		const shouldQueueCronPrompt =
-			isAgentMessagePromptInProgress ||
 			session.isStreaming ||
 			session.isCompacting ||
 			session.isRetrying ||
@@ -1802,149 +1754,43 @@ export class AgentDaemon {
 			const current = requirePersistedJob ? this.getRunnableCronJob(job.id) : runnableJob;
 			return current && this.isCronJobRunnableForState(current, state, requirePersistedJob) ? current : undefined;
 		};
-		if (isHeartbeatCronJob(runnableJob)) {
-			const streamingBehavior = resolveHeartbeatStreamingBehavior(runnableJob.deliveryMode);
-			const didPrompt = await this.promptHeartbeatWithAgentMessagePreparingGuard(
-				state,
-				runnableJob,
-				{
-					streamingBehavior,
-					followUpQueueKey: `heartbeat:${runnableJob.id}`,
-					source: "rpc",
-				},
-				getRunnableJob,
-			);
-			return didPrompt ? undefined : "skipped";
+		const current = getRunnableJob();
+		if (!current) {
+			return "skipped";
 		}
-		const canPrompt = () => getRunnableJob() !== undefined;
-		const didPrompt = await this.promptWithAgentMessagePreparingGuard(
-			state,
-			runnableJob.prompt,
-			{
+		// Re-check after the session admission fence wait: the job may have been cancelled, completed, or updated meanwhile.
+		const unrunnableAtAdmission = new Error("Cron job became unrunnable before admission");
+		const admissionCommitted = () => {
+			const refreshed = getRunnableJob();
+			if (!refreshed || refreshed.prompt !== current.prompt || refreshed.deliveryMode !== current.deliveryMode) {
+				throw unrunnableAtAdmission;
+			}
+		};
+		try {
+			if (isHeartbeatCronJob(current)) {
+				await session.promptHeartbeat(current, {
+					streamingBehavior: resolveHeartbeatStreamingBehavior(current.deliveryMode),
+					followUpQueueKey: `heartbeat:${current.id}`,
+					source: "rpc",
+					admissionCommitted,
+				});
+				return;
+			}
+			await session.promptUntilAccepted(current.prompt, {
 				streamingBehavior: "followUp",
 				source: "rpc",
-			},
-			canPrompt,
-			false,
-		);
-		return didPrompt ? undefined : "skipped";
+				admissionCommitted,
+			});
+		} catch (error) {
+			if (error === unrunnableAtAdmission) {
+				return "skipped";
+			}
+			throw error;
+		}
 	}
 
 	private getRunnableCronJob(jobId: string): AgentCronJob | undefined {
 		return this.cronStore.getClaimedJob(jobId) ?? this.cronStore.getDueJob(jobId);
-	}
-
-	// Wraps session.prompt so the target counts as "preparing" until the turn
-	// starts streaming (or the prompt settles); concurrent agent messages queue
-	// instead of racing agent.prompt during the preflight awaits. Refcounted so
-	// overlapping prompts each hold their own registration.
-	private async promptWithAgentMessagePreparingGuard(
-		state: ActiveSessionState,
-		message: string,
-		options?: PromptOptions,
-		canPrompt?: () => boolean,
-		waitForCompletion = true,
-	): Promise<boolean> {
-		return this.withAgentMessagePreparingGuard(
-			state,
-			(session, clearPreparing) => {
-				const prompt =
-					options?.agentMessageId !== undefined && options.expandPromptTemplates === false
-						? session.acceptAgentMessagePrompt.bind(session)
-						: waitForCompletion
-							? (session.promptAndWait ?? session.prompt).bind(session)
-							: (session.promptUntilAccepted ?? session.prompt).bind(session);
-				return prompt(message, {
-					...options,
-					preflightResult: (didSucceed, queued) => {
-						if (didSucceed && session.isStreaming) {
-							clearPreparing();
-						}
-						options?.preflightResult?.(didSucceed, queued);
-					},
-				});
-			},
-			canPrompt,
-			options?.signal,
-		);
-	}
-
-	private async promptHeartbeatWithAgentMessagePreparingGuard(
-		state: ActiveSessionState,
-		job: AgentCronJob,
-		options?: PromptOptions,
-		getPromptJob?: () => AgentCronJob | undefined,
-	): Promise<boolean> {
-		let promptJob = job;
-		return this.withAgentMessagePreparingGuard(
-			state,
-			(session, clearPreparing) =>
-				session.promptHeartbeat(promptJob, {
-					...options,
-					preflightResult: (didSucceed) => {
-						if (didSucceed && session.isStreaming) {
-							clearPreparing();
-						}
-						options?.preflightResult?.(didSucceed);
-					},
-				}),
-			() => {
-				if (!getPromptJob) {
-					return true;
-				}
-				const current = getPromptJob();
-				if (!current) {
-					return false;
-				}
-				promptJob = current;
-				return true;
-			},
-		);
-	}
-
-	private async withAgentMessagePreparingGuard(
-		state: ActiveSessionState,
-		run: (session: AgentSession, clearPreparing: () => void) => Promise<void>,
-		canRun?: () => boolean,
-		signal?: AbortSignal,
-	): Promise<boolean> {
-		const activeSessionId = state.activeSessionId;
-		this.agentMessagePreparingTargets.set(
-			activeSessionId,
-			(this.agentMessagePreparingTargets.get(activeSessionId) ?? 0) + 1,
-		);
-		let cleared = false;
-		const clearPreparing = () => {
-			if (cleared) {
-				return;
-			}
-			cleared = true;
-			const next = (this.agentMessagePreparingTargets.get(activeSessionId) ?? 1) - 1;
-			if (next <= 0) {
-				this.agentMessagePreparingTargets.delete(activeSessionId);
-			} else {
-				this.agentMessagePreparingTargets.set(activeSessionId, next);
-			}
-		};
-		try {
-			const targetLock = this.agentMessageTargetLocks.get(activeSessionId);
-			if (targetLock)
-				await waitForPromptAdmission(
-					targetLock.catch(() => undefined),
-					signal,
-				);
-			if (this.sessions.get(activeSessionId) !== state || this.closingSessions.has(activeSessionId)) {
-				throw new Error("Target session is closing before prompt delivery");
-			}
-			if (canRun && !canRun()) {
-				return false;
-			}
-			const session = state.runtime.session;
-			await run(session, clearPreparing);
-			return true;
-		} finally {
-			clearPreparing();
-		}
 	}
 
 	private createCronJobForState(state: ActiveSessionState, schedule: string, prompt: string): AgentCronJob {
@@ -2717,13 +2563,9 @@ export class AgentDaemon {
 					job.status !== "completed",
 			);
 		const hasPendingAdmission =
-			this.agentMessageAcceptingTargets.has(state.activeSessionId) ||
-			this.agentMessagePreparingTargets.has(state.activeSessionId) ||
-			this.agentMessageTargetLocks.has(state.activeSessionId) ||
 			[...this.promptAdmissions.values()].some(
 				(admission) => admission.activeSessionId === state.activeSessionId && admission.status !== "cancelled",
-			) ||
-			state.runtime.session.hasPendingAdmissionWaiters;
+			) || state.runtime.session.hasPendingAdmissionWaiters;
 		return {
 			isSessionActive: summary.isSessionActive || summary.hasRunningRlmChildren === true || hasPendingAdmission,
 			attachedClients: state.clients.size + state.pendingAttaches,
@@ -2790,12 +2632,9 @@ export class AgentDaemon {
 			try {
 				await this.closeSession(state, "shutdown", true, false);
 			} catch (error) {
-				// A pre-removal close failure must not strand a resident child outside its
-				// parent's ownership map or disconnect its event forwarder.
 				if (
 					this.sessions.get(state.activeSessionId) === state &&
-					this.sessions.get(parentActiveSessionId) === parentState &&
-					parentState.runtime.session.registerRlmChildSession(childId, state.runtime.session, unsubscribeChild)
+					this.sessions.get(parentActiveSessionId) === parentState
 				) {
 					throw error;
 				}
@@ -3338,6 +3177,11 @@ export class AgentDaemon {
 			socket.off("close", cleanup);
 			socket.off("error", cleanup);
 			this.clearClientCatchupRetry(client);
+			for (const [pauseId, entry] of this.sessionInputPauses) {
+				if (entry.owner !== client) continue;
+				entry.pause.release();
+				this.sessionInputPauses.delete(pauseId);
+			}
 			this.detachClient(client);
 			client.detachInput();
 			this.clients.delete(client);
@@ -3640,13 +3484,6 @@ export class AgentDaemon {
 					this.write(client, success(command.id, "detach"));
 					return;
 				}
-				case "worker_sync_agent_peers":
-					this.remoteAgentPeers.clear();
-					for (const peer of command.peers) {
-						this.remoteAgentPeers.set(peer.activeSessionId, peer);
-					}
-					this.writeWorkerSuccess(client, command);
-					return;
 				case "worker_archive_and_shutdown": {
 					for (const state of [...this.sessions.values()]) {
 						await this.closeSession(state, "killed");
@@ -3714,6 +3551,12 @@ export class AgentDaemon {
 					}
 					if (transaction) this.cancelPreparedUpdateRestart(transaction.id);
 					this.writeWorkerSuccess(client, command);
+					return;
+				}
+				default: {
+					// Legacy commands from older supervisors (e.g. worker_sync_agent_peers) must fail fast, not time out.
+					const unknown = command as { id?: string; type: string };
+					this.write(client, failure(unknown.id, unknown.type, `Unknown worker command: ${unknown.type}`));
 					return;
 				}
 			}
@@ -3941,8 +3784,18 @@ export class AgentDaemon {
 			case "detach": {
 				if (command.activeSessionId) {
 					const state = this.getSessionState(command.activeSessionId);
+					for (const [pauseId, entry] of this.sessionInputPauses) {
+						if (entry.owner !== client || entry.activeSessionId !== command.activeSessionId) continue;
+						entry.pause.release();
+						this.sessionInputPauses.delete(pauseId);
+					}
 					this.detachClientFromSession(client, state);
 				} else {
+					for (const [pauseId, entry] of this.sessionInputPauses) {
+						if (entry.owner !== client) continue;
+						entry.pause.release();
+						this.sessionInputPauses.delete(pauseId);
+					}
 					this.detachClient(client);
 				}
 				return success(command.id, "detach");
@@ -3960,7 +3813,7 @@ export class AgentDaemon {
 				if (!name) {
 					throw new Error("Session name cannot be empty");
 				}
-				await this.setStateSessionName(state, name);
+				await this.setStateSessionNameForCommand(state, name);
 				return success(command.id, "rename", summaryForActiveSession(state));
 			}
 
@@ -3974,7 +3827,7 @@ export class AgentDaemon {
 					throw new Error("Session name cannot be empty");
 				}
 				if (state) {
-					await this.setStateSessionName(state, name);
+					await this.setStateSessionNameForCommand(state, name);
 				} else {
 					const info = await readSessionInfo(command.sessionPath);
 					if (!info) throw new Error(`Session not found: ${command.sessionPath}`);
@@ -4037,6 +3890,7 @@ export class AgentDaemon {
 					});
 				}
 				if (admission.status === "owned") {
+					if (command.cancelOwned) admission.controller?.abort();
 					return success(command.id, command.type, {
 						status: "owned" as const,
 					});
@@ -4094,7 +3948,7 @@ export class AgentDaemon {
 				};
 				if (command.type === "prompt_and_wait") {
 					try {
-						await this.promptWithAgentMessagePreparingGuard(state, command.message, {
+						await state.runtime.session.promptAndWait(command.message, {
 							...options,
 							preflightResult: (didSucceed) => {
 								if (didSucceed) this.recordWorkerRecoveryState(state, "prompt_accepted", true);
@@ -4113,25 +3967,23 @@ export class AgentDaemon {
 					responseSent = true;
 					this.write(client, success(command.id, "prompt"));
 				};
-				void this.promptWithAgentMessagePreparingGuard(
-					state,
-					command.message,
-					{
-						...options,
-						agentMessageId: command.agentMessageId,
-						customMessage: command.customMessage,
-						preflightResult: (didSucceed) => {
-							if (didSucceed) {
-								this.recordWorkerRecoveryState(state, "prompt_accepted", true);
-								sendSuccessResponse();
-							} else {
-								preflightRejected = true;
-							}
-						},
+				const prompt =
+					command.agentMessageId !== undefined && command.expandPromptTemplates === false
+						? state.runtime.session.acceptAgentMessagePrompt.bind(state.runtime.session)
+						: state.runtime.session.promptUntilAccepted.bind(state.runtime.session);
+				void prompt(command.message, {
+					...options,
+					agentMessageId: command.agentMessageId,
+					customMessage: command.customMessage,
+					preflightResult: (didSucceed) => {
+						if (didSucceed) {
+							this.recordWorkerRecoveryState(state, "prompt_accepted", true);
+							sendSuccessResponse();
+						} else {
+							preflightRejected = true;
+						}
 					},
-					undefined,
-					false,
-				)
+				})
 					.then(() => {
 						if (preflightRejected) {
 							const error = new Error("Prompt was not accepted by the session.");
@@ -4260,10 +4112,8 @@ export class AgentDaemon {
 
 			case "agent_messages_clear": {
 				const state = this.getSessionState(command.activeSessionId);
-				const cleared = await this.withAgentMessageTargetLock(state.activeSessionId, async () => {
-					this.agentMessageRateLimiter.clearMatching((key) => key.endsWith(`->${state.activeSessionId}`));
-					return state.runtime.session.clearQueuedUserMessagesMatching(isAgentSessionMessagePrompt);
-				});
+				this.agentMessageRateLimiter.clearMatching((key) => key.endsWith(`->${state.activeSessionId}`));
+				const cleared = state.runtime.session.clearQueuedAgentMessages();
 				return success(command.id, "agent_messages_clear", cleared);
 			}
 
@@ -4328,28 +4178,23 @@ export class AgentDaemon {
 				}
 				// Respond before completion (bash can outlive the client request
 				// timeout); output and completion stream via bash_* session events.
-				void state.runtime.session
-					.runUserBash(command.command, {
-						excludeFromContext: command.excludeFromContext,
-						transient: command.transient,
-						runId: command.runId,
-					})
-					.catch((error) => {
-						this.broadcastToSession(
-							state,
-							failure(undefined, "execute_bash", error, serializeDaemonError(error)),
-						);
-					});
+				const bash = state.runtime.session.runUserBash(command.command, {
+					excludeFromContext: command.excludeFromContext,
+					transient: command.transient,
+					runId: command.runId,
+				});
+				state.inFlightBash = Promise.allSettled([state.inFlightBash, bash]).then(() => undefined);
+				void bash.catch((error) => {
+					this.broadcastToSession(state, failure(undefined, "execute_bash", error, serializeDaemonError(error)));
+				});
 				return success(command.id, "execute_bash");
 			}
 
 			case "execute_bash_and_wait": {
 				const state = this.getSessionState(command.activeSessionId);
-				return success(
-					command.id,
-					"execute_bash_and_wait",
-					await state.runtime.session.executeBash(command.command),
-				);
+				const bash = state.runtime.session.executeBash(command.command);
+				state.inFlightBash = Promise.allSettled([state.inFlightBash, bash]).then(() => undefined);
+				return success(command.id, "execute_bash_and_wait", await bash);
 			}
 
 			case "abort_bash": {
@@ -4386,6 +4231,38 @@ export class AgentDaemon {
 				});
 			}
 
+			case "acquire_session_input_pause": {
+				const existing = [...this.sessionInputPauses].find(
+					([, entry]) =>
+						entry.owner === client &&
+						entry.activeSessionId === command.activeSessionId &&
+						entry.leaseKey === command.leaseKey,
+				);
+				if (existing) {
+					return success(command.id, "acquire_session_input_pause", { pauseId: existing[0] });
+				}
+				const state = this.getSessionState(command.activeSessionId);
+				const pauseId = randomUUID();
+				this.sessionInputPauses.set(pauseId, {
+					activeSessionId: command.activeSessionId,
+					owner: client,
+					leaseKey: command.leaseKey,
+					pause: state.runtime.session.acquireSessionInputPause(),
+				});
+				return success(command.id, "acquire_session_input_pause", { pauseId });
+			}
+
+			case "release_session_input_pause": {
+				const entry = this.sessionInputPauses.get(command.pauseId);
+				if (!entry) return success(command.id, "release_session_input_pause");
+				if (entry.owner !== client || entry.activeSessionId !== command.activeSessionId) {
+					throw new Error(`Session input pause is owned by another client: ${command.pauseId}`);
+				}
+				this.sessionInputPauses.delete(command.pauseId);
+				entry.pause.release();
+				return success(command.id, "release_session_input_pause");
+			}
+
 			case "wait_for_idle": {
 				const state = this.getSessionState(command.activeSessionId);
 				await state.runtime.session.waitForIdle();
@@ -4397,7 +4274,9 @@ export class AgentDaemon {
 				return success(
 					command.id,
 					"wait_for_headless_completion",
-					await waitForHeadlessCompletion(state.runtime.session),
+					await waitForHeadlessCompletion(state.runtime.session, {
+						waitForRlmQuiescence: command.waitForRlmQuiescence,
+					}),
 				);
 			}
 
@@ -4422,6 +4301,14 @@ export class AgentDaemon {
 				const state = this.getSessionState(command.activeSessionId);
 				return success(command.id, "get_messages", {
 					messages: state.runtime.session.messages,
+				});
+			}
+
+			case "get_rlm_children": {
+				const state = this.getSessionState(command.activeSessionId);
+				return success(command.id, "get_rlm_children", {
+					children: state.runtime.session.getRlmChildSnapshots(),
+					eventSequence: state.lastEventSequence,
 				});
 			}
 
@@ -4450,6 +4337,83 @@ export class AgentDaemon {
 					"get_resource_snapshot",
 					createAgentConnectionResourceSnapshot(state.runtime.session),
 				);
+			}
+
+			case "replace_acp_mcp_servers": {
+				if (!command.ownerId) throw new Error("ACP MCP owner id is required");
+				const state = this.getSessionState(command.activeSessionId);
+				if (!state.clients.has(client)) throw new Error("Daemon client is not attached to this session");
+				if (command.servers.length > 0 && state.runtime.session.isStreaming) {
+					throw new Error("Cannot replace ACP MCP servers while the agent is running");
+				}
+				const commandPause =
+					command.servers.length > 0 ? state.runtime.session.acquireSessionInputPause() : undefined;
+				try {
+					let currentOwner = this.acpMcpOwners.get(state.activeSessionId);
+					if (currentOwner?.release) {
+						await currentOwner.release.catch(() => undefined);
+						currentOwner = this.acpMcpOwners.get(state.activeSessionId);
+					}
+					const ownedByClient = currentOwner?.client === client && currentOwner.ownerId === command.ownerId;
+					if (command.servers.length === 0 && !ownedByClient) {
+						return success(command.id, "replace_acp_mcp_servers");
+					}
+					if (command.servers.length === 0) {
+						if (!currentOwner) return success(command.id, "replace_acp_mcp_servers");
+						const release = state.runtime.session.releaseAcpMcpServers(command.ownerId, currentOwner.serverNames);
+						currentOwner.release = release;
+						try {
+							await release;
+						} catch (error) {
+							currentOwner.release = undefined;
+							throw error;
+						}
+						if (this.acpMcpOwners.get(state.activeSessionId) === currentOwner) {
+							this.acpMcpOwners.delete(state.activeSessionId);
+						}
+						return success(command.id, "replace_acp_mcp_servers");
+					}
+
+					if (currentOwner && !ownedByClient) {
+						throw new Error("ACP MCP configuration is owned by another daemon client");
+					}
+					const claim = {
+						client,
+						ownerId: command.ownerId,
+						serverNames: [
+							...new Set([
+								...(currentOwner?.serverNames ?? []),
+								...command.servers.map((server) => server.name),
+							]),
+						],
+					};
+					this.acpMcpOwners.set(state.activeSessionId, claim);
+					const rollback = async (): Promise<void> => {
+						try {
+							await state.runtime.session.releaseAcpMcpServers(command.ownerId, claim.serverNames);
+						} catch (error) {
+							this.log(`failed to roll back ACP MCP config: ${String(error)}`);
+						}
+						if (this.acpMcpOwners.get(state.activeSessionId) === claim) {
+							this.acpMcpOwners.delete(state.activeSessionId);
+						}
+					};
+					try {
+						await withClientEnv(state.clientEnv, async () =>
+							state.runtime.session.replaceAcpMcpServers(command.servers, command.ownerId),
+						);
+					} catch (error) {
+						await rollback();
+						throw error;
+					}
+					if (!state.clients.has(client) || this.acpMcpOwners.get(state.activeSessionId) !== claim) {
+						await rollback();
+						throw new Error("Daemon client detached during ACP MCP replacement");
+					}
+					return success(command.id, "replace_acp_mcp_servers");
+				} finally {
+					commandPause?.release();
+				}
 			}
 
 			case "get_available_models": {
@@ -4750,7 +4714,7 @@ export class AgentDaemon {
 				if (!name) {
 					throw new Error("Session name cannot be empty");
 				}
-				await this.setStateSessionName(state, name);
+				await this.setStateSessionNameForCommand(state, name);
 				return success(command.id, "set_session_name");
 			}
 
@@ -4932,7 +4896,7 @@ export class AgentDaemon {
 				sequence: state.lastEventSequence,
 			},
 			...(parent ? { parent } : {}),
-			...(children.length > 0 ? { children } : {}),
+			children,
 		};
 	}
 
@@ -5219,7 +5183,32 @@ export class AgentDaemon {
 		};
 	}
 
-	private async createAgentMessageListResult(current: ActiveSessionState): Promise<AgentSessionMessageListResult> {
+	private async listSupervisorAgentPeers(): Promise<AgentSessionMessageAgentSummary[]> {
+		const supervisorSocketPath = this.supervisorSocketPathFromEnv();
+		if (!this.options.worker || !supervisorSocketPath) return [];
+		const client = new DaemonClient(supervisorSocketPath);
+		try {
+			await client.connect(1000);
+			await client.waitForHello(1000);
+			const response = await client.request(
+				{ type: "list_agent_peers", workerToken: this.options.worker.authenticationToken },
+				5000,
+			);
+			if (!response.success) throw deserializeDaemonError(response);
+			// SAFETY: The authenticated supervisor constructs the peer response.
+			return (response.data as { peers: AgentSessionMessageAgentSummary[] }).peers;
+		} catch {
+			return [];
+		} finally {
+			client.close();
+		}
+	}
+
+	private async createAgentMessageListResult(
+		current: ActiveSessionState,
+		peers?: AgentSessionMessageAgentSummary[],
+	): Promise<AgentSessionMessageListResult> {
+		peers ??= await this.listSupervisorAgentPeers();
 		const localAgents = this.listTargetableSessionStates(current).map((state) =>
 			this.createAgentMessageAgentSummary(state),
 		);
@@ -5252,28 +5241,24 @@ export class AgentDaemon {
 			});
 		}
 		const localIds = new Set(localAgents.map((agent) => agent.activeSessionId));
+		const remoteAgents = peers.filter(
+			(peer) => !localIds.has(peer.activeSessionId) && !this.closingSessions.has(peer.activeSessionId),
+		);
 		return {
 			current: this.createAgentSessionMessageEndpoint(current),
-			agents: [
-				...localAgents,
-				...[...this.remoteAgentPeers.values()].filter(
-					(peer) =>
-						peer.status !== "inactive" &&
-						!localIds.has(peer.activeSessionId) &&
-						!this.closingSessions.has(peer.activeSessionId),
-				),
-			],
+			agents: [...localAgents, ...remoteAgents],
 		};
 	}
 
 	private async createAgentFamilyCatalog(currentState?: ActiveSessionState): Promise<AgentFamilyCatalogEntry[]> {
 		const current =
 			currentState ?? [...this.sessions.values()].find((state) => !this.bindingSessions.has(state.activeSessionId));
-		const listed = current ? await this.createAgentMessageListResult(current) : { agents: [] };
-		const remotePeers = new Set(this.remoteAgentPeers.values());
+		const remotePeers = current ? await this.listSupervisorAgentPeers() : [];
+		const listed = current ? await this.createAgentMessageListResult(current, remotePeers) : { agents: [] };
+		const remotePeerSet = new Set(remotePeers);
 		const localAgents = current
-			? [this.createAgentMessageAgentSummary(current), ...listed.agents.filter((agent) => !remotePeers.has(agent))]
-			: listed.agents.filter((agent) => !remotePeers.has(agent));
+			? [this.createAgentMessageAgentSummary(current), ...listed.agents.filter((agent) => !remotePeerSet.has(agent))]
+			: listed.agents;
 		const activePaths = new Set(
 			localAgents.flatMap((agent) => (agent.sessionPath ? [canonicalSessionPath(agent.sessionPath)] : [])),
 		);
@@ -5314,7 +5299,7 @@ export class AgentDaemon {
 				...(agent.sessionPath ? { sessionPath: canonicalSessionPath(agent.sessionPath) } : {}),
 			});
 		};
-		for (const peer of this.remoteAgentPeers.values()) addAgent(peer);
+		for (const peer of remotePeers) addAgent(peer);
 		for (const agent of localAgents) addAgent(agent);
 		for (const state of this.sessions.values()) {
 			const entry = byId.get(state.runtime.session.sessionId);
@@ -5424,6 +5409,15 @@ export class AgentDaemon {
 		}
 	}
 
+	private setStateSessionNameForCommand(state: ActiveSessionState, name: string): Promise<void> {
+		return this.options.worker ? this.applyStateSessionName(state, name) : this.setStateSessionName(state, name);
+	}
+
+	private async applyStateSessionName(state: ActiveSessionState, name: string): Promise<void> {
+		state.runtime.session.setSessionName(name);
+		await this.appendRlmLedgerRenameForState(state, name);
+	}
+
 	private async setStateSessionName(state: ActiveSessionState, name: string): Promise<void> {
 		const normalizedName = name.trim();
 		if (!normalizedName) {
@@ -5446,8 +5440,7 @@ export class AgentDaemon {
 			},
 			async () => {
 				await this.assertStateSessionNameAvailable(state, normalizedName);
-				state.runtime.session.setSessionName(normalizedName);
-				await this.appendRlmLedgerRenameForState(state, normalizedName);
+				await this.applyStateSessionName(state, normalizedName);
 			},
 		);
 	}
@@ -5477,57 +5470,13 @@ export class AgentDaemon {
 	}
 
 	private async clearQueuedAgentSessionMessagesForState(state: ActiveSessionState) {
-		return this.withAgentMessageTargetLock(state.activeSessionId, async () =>
-			state.runtime.session.clearQueuedUserMessagesMatching(isAgentSessionMessagePrompt),
-		);
+		return state.runtime.session.clearQueuedAgentMessages();
 	}
 
 	private async clearQueuedAgentSessionMessagesForAllStates(): Promise<void> {
 		await Promise.all(
 			[...this.sessions.values()].map((state) => this.clearQueuedAgentSessionMessagesForState(state)),
 		);
-	}
-
-	private reserveAgentMessageQueueSlot(targetState: ActiveSessionState): () => void {
-		const activeSessionId = targetState.activeSessionId;
-		const reserved = this.agentMessagePendingReservations.get(activeSessionId) ?? 0;
-		assertAgentMessageQueueCapacity(
-			targetState.runtime.session.unfinishedActionCount + reserved,
-			DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
-		);
-		this.agentMessagePendingReservations.set(activeSessionId, reserved + 1);
-		let released = false;
-		return () => {
-			if (released) {
-				return;
-			}
-			released = true;
-			const next = (this.agentMessagePendingReservations.get(activeSessionId) ?? 1) - 1;
-			if (next <= 0) {
-				this.agentMessagePendingReservations.delete(activeSessionId);
-			} else {
-				this.agentMessagePendingReservations.set(activeSessionId, next);
-			}
-		};
-	}
-
-	private async withAgentMessageTargetLock<T>(activeSessionId: string, run: () => Promise<T>): Promise<T> {
-		const previous = this.agentMessageTargetLocks.get(activeSessionId) ?? Promise.resolve();
-		let releaseCurrent: () => void = () => {};
-		const current = new Promise<void>((resolve) => {
-			releaseCurrent = resolve;
-		});
-		const next = previous.catch(() => undefined).then(() => current);
-		this.agentMessageTargetLocks.set(activeSessionId, next);
-		await previous.catch(() => undefined);
-		try {
-			return await run();
-		} finally {
-			releaseCurrent();
-			if (this.agentMessageTargetLocks.get(activeSessionId) === next) {
-				this.agentMessageTargetLocks.delete(activeSessionId);
-			}
-		}
 	}
 
 	private agentFamilyEntry(state: ActiveSessionState): AgentFamilyCatalogEntry {
@@ -5702,13 +5651,11 @@ export class AgentDaemon {
 		if (options.origin === "agent" && options.fromState) {
 			this.assertAgentFamilyReachable(options.fromState, targetState);
 		}
-		const releaseQueueSlot = this.reserveAgentMessageQueueSlot(targetState);
 		const senderKey =
 			options.senderKey ?? options.fromState?.activeSessionId ?? `client:${options.clientId ?? "unknown"}`;
 		const rateLimitKey = `${senderKey}->${targetState.activeSessionId}`;
 		const rateLimit = this.agentMessageRateLimiter.tryConsume(rateLimitKey);
 		if (!rateLimit.ok) {
-			releaseQueueSlot();
 			throw new Error(`Agent messaging rate limit exceeded; retry after ${rateLimit.retryAfterMs}ms`);
 		}
 		const payload: AgentSessionMessagePayload = {
@@ -5722,28 +5669,11 @@ export class AgentDaemon {
 			target: this.createAgentSessionMessageEndpoint(targetState),
 		};
 		try {
-			const { status } = await this.withAgentMessageTargetLock(targetState.activeSessionId, async () => {
-				if (this.agentMessagesPaused) {
-					throw new Error("Agent messaging is paused");
-				}
-				if (
-					!this.sessions.has(targetState.activeSessionId) ||
-					this.closingSessions.has(targetState.activeSessionId)
-				) {
-					throw new Error("Target session is closing before agent message delivery");
-				}
-				if (targetState.runtime.session.sessionId !== payload.target.sessionId) {
-					throw new Error("Target session changed before agent message delivery");
-				}
-				return this.acceptAgentSessionMessage(targetState, payload, releaseQueueSlot);
-			});
+			const { status } = await this.acceptAgentSessionMessage(targetState, payload);
 			return createAgentSessionMessageReceipt(payload, status);
 		} catch (error) {
 			this.agentMessageRateLimiter.refund(rateLimitKey);
 			throw error;
-		} finally {
-			// Error-path backstop; success paths release inside acceptAgentSessionMessage.
-			releaseQueueSlot();
 		}
 	}
 
@@ -5757,113 +5687,97 @@ export class AgentDaemon {
 			throw new Error(`Unknown active session: ${targetSelector}`);
 		}
 		const deadline = Date.now() + 30_000;
+		let client: DaemonClient | undefined;
 		let lastError: unknown;
 		while (Date.now() < deadline && !this.shuttingDown) {
-			const client = new DaemonClient(supervisorSocketPath);
-			let receivedResponse = false;
+			const candidate = new DaemonClient(supervisorSocketPath);
 			try {
-				await client.connect(1000);
-				await client.waitForHello(1000);
-				const response = await client.request(
-					{
-						type: "send_message",
-						targetActiveSessionId: targetSelector,
-						message,
-						fromActiveSessionId: fromState.activeSessionId,
-						agentOrigin: true,
-					},
-					30_000,
-				);
-				receivedResponse = true;
-				if (!response.success) {
-					throw deserializeDaemonError(response);
-				}
-				if (!response.data || typeof response.data !== "object") {
-					throw new Error("Supervisor returned an invalid agent-message receipt");
-				}
-				return response.data as AgentSessionMessageReceipt;
+				await candidate.connect(1000);
+				await candidate.waitForHello(1000);
+				client = candidate;
+				break;
 			} catch (error) {
 				lastError = error;
-				if (receivedResponse) {
-					throw error;
-				}
-			} finally {
-				client.close();
+				candidate.close();
 			}
 			await new Promise((resolveDelay) => setTimeout(resolveDelay, 250));
 		}
-		throw lastError instanceof Error ? lastError : new Error(`Unknown active session: ${targetSelector}`);
+		if (!client) {
+			throw lastError instanceof Error ? lastError : new Error(`Unknown active session: ${targetSelector}`);
+		}
+		try {
+			const response = await client.request(
+				{
+					type: "send_message",
+					targetActiveSessionId: targetSelector,
+					message,
+					fromActiveSessionId: fromState.activeSessionId,
+					agentOrigin: true,
+				},
+				30_000,
+			);
+			if (!response.success) {
+				throw deserializeDaemonError(response);
+			}
+			if (!response.data || typeof response.data !== "object") {
+				throw new Error("Supervisor returned an invalid agent-message receipt");
+			}
+			return response.data as AgentSessionMessageReceipt;
+		} finally {
+			client.close();
+		}
 	}
 
 	private async acceptAgentSessionMessage(
 		targetState: ActiveSessionState,
 		payload: AgentSessionMessagePayload,
-		releaseReservation: () => void,
 	): Promise<{ status: AgentSessionMessageDeliveryStatus }> {
-		const session = targetState.runtime.session;
-		const reserved = this.agentMessagePendingReservations.get(targetState.activeSessionId) ?? 0;
-		const otherReservations = Math.max(0, reserved - 1);
-		assertAgentMessageQueueCapacity(
-			session.unfinishedActionCount + otherReservations,
-			DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
-		);
-		const shouldQueue =
-			this.agentMessageAcceptingTargets.has(targetState.activeSessionId) ||
-			this.agentMessagePreparingTargets.has(targetState.activeSessionId) ||
-			session.isStreaming ||
-			session.isCompacting ||
-			session.isRetrying ||
-			session.isBashRunning ||
-			session.unfinishedActionCount > 0;
-		const streamingBehavior = "steer";
 		const message = createAgentSessionMessage(payload);
-		const prompt = message.content;
-
-		if (shouldQueue) {
-			const didQueue = await session.queueAgentMessagePrompt(prompt, streamingBehavior, message);
-			if (!didQueue) {
-				throw new Error("Agent message was not queued");
-			}
-			// The queued message now counts in unfinishedActionCount.
-			releaseReservation();
-			// Do not await delivery: a queued message delivers only when the target's
-			// turn progresses, and the sender is blocked inside its own turn — awaiting
-			// here deadlocks mutual sends between busy sessions.
-			return { status: "queued" };
-		}
-
-		this.agentMessageAcceptingTargets.add(targetState.activeSessionId);
 		let preflightFailed = false;
 		let preflightQueued = false;
-		try {
-			const promptOptions: PromptOptions = {
-				expandPromptTemplates: false,
-				streamingBehavior,
-				queueIfBusy: true,
-				preflightResult: (didSucceed, didQueue) => {
-					preflightFailed = !didSucceed;
-					preflightQueued = didSucceed && didQueue === true;
-				},
-			};
-			if (typeof session.acceptAgentMessagePrompt === "function") {
-				await session.acceptAgentMessagePrompt(prompt, {
-					...promptOptions,
-					customMessage: message,
-				});
-			} else {
-				await session.prompt(prompt, promptOptions);
-			}
-			if (preflightFailed) {
-				throw new Error("Agent message was not accepted");
-			}
-			releaseReservation();
-			return { status: preflightQueued ? "queued" : "delivered" };
-		} finally {
-			this.agentMessageAcceptingTargets.delete(targetState.activeSessionId);
+		await targetState.runtime.session.acceptAgentMessagePrompt(message.content, {
+			expandPromptTemplates: false,
+			streamingBehavior: "steer",
+			queueIfBusy: true,
+			customMessage: message,
+			admissionCommitted: () => {
+				if (this.agentMessagesPaused) {
+					throw new Error("Agent messaging is paused");
+				}
+				if (
+					!this.sessions.has(targetState.activeSessionId) ||
+					this.closingSessions.has(targetState.activeSessionId)
+				) {
+					throw new Error("Target session is closing before agent message delivery");
+				}
+				if (targetState.runtime.session.sessionId !== payload.target.sessionId) {
+					throw new Error("Target session changed before agent message delivery");
+				}
+			},
+			preflightResult: (didSucceed, didQueue) => {
+				preflightFailed = !didSucceed;
+				preflightQueued = didSucceed && didQueue === true;
+			},
+		});
+		if (preflightFailed) {
+			throw new Error("Agent message was not accepted");
 		}
+		return { status: preflightQueued ? "queued" : "delivered" };
 	}
 
 	private detachClientFromSession(client: DaemonSocketClient, state: ActiveSessionState): void {
+		const acpMcpOwner = this.acpMcpOwners.get(state.activeSessionId);
+		if (acpMcpOwner?.client === client && !acpMcpOwner.release) {
+			const release = state.runtime.session.releaseAcpMcpServers(acpMcpOwner.ownerId, acpMcpOwner.serverNames);
+			acpMcpOwner.release = release;
+			void release
+				.catch((error) => this.log(`failed to release detached ACP MCP config: ${String(error)}`))
+				.finally(() => {
+					if (this.acpMcpOwners.get(state.activeSessionId) === acpMcpOwner) {
+						this.acpMcpOwners.delete(state.activeSessionId);
+					}
+				});
+		}
 		this.abortSideQuestionsFor(client, state.activeSessionId);
 		abortClientSnapshotStreaming(client, state.activeSessionId);
 		detachClientFromActiveSession(client, state);
@@ -6311,14 +6225,12 @@ export class AgentDaemon {
 	}
 
 	private async abortBashForClose(state: ActiveSessionState): Promise<void> {
-		if (!state.runtime.session.isBashRunning) {
+		const session = state.runtime.session;
+		if (!session.isBashRunning) {
 			return;
 		}
-		state.runtime.session.abortBash();
-		const deadline = Date.now() + UPDATE_RESTART_ABORT_BASH_TIMEOUT_MS;
-		while (state.runtime.session.isBashRunning && Date.now() < deadline) {
-			await delay(50);
-		}
+		session.abortBash();
+		await Promise.race([state.inFlightBash ?? Promise.resolve(), delay(UPDATE_RESTART_ABORT_BASH_TIMEOUT_MS)]);
 	}
 
 	private async closeSessionOnce(
@@ -6388,6 +6300,7 @@ export class AgentDaemon {
 			removeDaemonClientSessionCapabilities(client, state.activeSessionId);
 		}
 		state.clients.clear();
+		this.acpMcpOwners.delete(state.activeSessionId);
 		this.sessions.delete(state.activeSessionId);
 		if (isEmptyDraftSession) {
 			const sessionFile = state.runtime.session.sessionFile;
