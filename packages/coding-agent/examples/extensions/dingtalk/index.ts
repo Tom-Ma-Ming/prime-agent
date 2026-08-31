@@ -21,18 +21,52 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { basename, isAbsolute, resolve as resolvePath } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type DingTalkConfig, isConfigured, resolveConfig } from "./config.js";
-import { CONFIG_FLAG, checkGitExposure, discoverConfigPath, readConfigFile } from "./config-file.js";
+import { CONFIG_FLAG, checkGitExposure, defaultAgentDir, discoverConfigPath, readConfigFile } from "./config-file.js";
 import { DingTalkApi } from "./dingtalk-api.js";
 import { formatAnswer, formatQuestion, splitMarkdown, summarize } from "./markdown.js";
 import { InboundRouter, mirrorTargets, parseBridgeCommand, ReplyQueue } from "./router.js";
+import { acquireBotLock, type InstanceLock } from "./single-instance.js";
 import { DingTalkStreamClient } from "./stream-client.js";
 import { lastAssistantText } from "./transcript.js";
-import type { InboundMessage, OutboundMessage, ReplyTarget } from "./types.js";
+import type { BridgeCommand, InboundMessage, OutboundMessage, ReplyTarget } from "./types.js";
 
 /** Minimum gap between two AI-card streaming updates. */
 const CARD_THROTTLE_MS = 700;
+
+/** Thinking levels a chat user may name. Kept here so the reply can list them. */
+const THINKING_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
+type ThinkingLevelName = (typeof THINKING_LEVELS)[number];
+
+/**
+ * Parameters for the image tool, written as plain JSON Schema.
+ *
+ * The host builds these with typebox, but this bridge takes no npm dependencies — including the
+ * host's — so that it keeps loading from `~/.prime/agent/extensions/` with nothing installed.
+ */
+const SEND_IMAGE_PARAMS = {
+	type: "object",
+	properties: {
+		path: {
+			type: "string",
+			description: "Path to an existing image file. Relative paths resolve against the working directory.",
+		},
+		caption: {
+			type: "string",
+			description: "Optional line of text sent just before the image.",
+		},
+		alsoGroups: {
+			type: "boolean",
+			description:
+				"Also send to the spectator groups. Off by default: a terminal run is watched in the terminal, so pushing its screenshots to a group is noise.",
+		},
+	},
+	required: ["path"],
+	additionalProperties: false,
+};
 
 interface CardSession {
 	outTrackId: string;
@@ -59,6 +93,7 @@ export default function dingTalkExtension(pi: ExtensionAPI): void {
 	let router: InboundRouter | undefined;
 	const queue = new ReplyQueue();
 
+	let botLock: InstanceLock | undefined;
 	let progressTimer: ReturnType<typeof setTimeout> | undefined;
 	let card: CardSession | undefined;
 
@@ -153,12 +188,292 @@ export default function dingTalkExtension(pi: ExtensionAPI): void {
 		}, wait);
 	};
 
-	const handleBridgeCommand = async (command: string, target: ReplyTarget, cfg: DingTalkConfig) => {
+	/** `provider/id`, the form a chat user can type back at the bridge. */
+	const modelLabel = (model: { provider: string; id: string }) => `${model.provider}/${model.id}`;
+
+	/**
+	 * Answer `/model`, the one terminal affordance a chat has no substitute for.
+	 *
+	 * A picker needs a screen, so the query is matched as a substring and an ambiguous one lists
+	 * its candidates rather than guessing: silently landing on the wrong model is worse than
+	 * asking again.
+	 */
+	const handleModelCommand = async (query: string | undefined, target: ReplyTarget, cfg: DingTalkConfig) => {
 		if (!context) return;
-		if (command === "stop") {
+		const available = context.modelRegistry?.getAvailable() ?? [];
+		const current = context.model;
+		const currentLine = current ? `当前模型：\`${modelLabel(current)}\`` : "当前没有选定模型。";
+
+		if (!query) {
+			await deliver(
+				() =>
+					sendChunked(
+						target,
+						"模型",
+						`${currentLine}\n\n可用模型 ${available.length} 个。发送 \`/model <关键词>\` 切换，例如 \`/model sonnet\`。`,
+						cfg,
+					),
+				"model reply",
+			);
+			return;
+		}
+
+		const needle = query.toLowerCase();
+		const matches = available.filter(
+			(model) => modelLabel(model).toLowerCase().includes(needle) || model.name.toLowerCase().includes(needle),
+		);
+
+		if (matches.length === 0) {
+			await deliver(
+				() => sendChunked(target, "模型", `没有匹配 \`${query}\` 的可用模型。\n\n${currentLine}`, cfg),
+				"model reply",
+			);
+			return;
+		}
+
+		// An exact id still wins when it is also a prefix of longer ids.
+		const exact = matches.find(
+			(model) => modelLabel(model).toLowerCase() === needle || model.id.toLowerCase() === needle,
+		);
+		const chosen = exact ?? (matches.length === 1 ? matches[0] : undefined);
+
+		if (!chosen) {
+			const shown = matches.slice(0, 15).map((model) => `- \`${modelLabel(model)}\``);
+			const more =
+				matches.length > shown.length
+					? `\n\n…另有 ${matches.length - shown.length} 个未列出，请给更精确的关键词。`
+					: "";
+			await deliver(
+				() =>
+					sendChunked(
+						target,
+						"模型",
+						`\`${query}\` 匹配到 ${matches.length} 个模型：\n\n${shown.join("\n")}${more}`,
+						cfg,
+					),
+				"model reply",
+			);
+			return;
+		}
+
+		const switched = await pi.setModel(chosen);
+		const text = switched
+			? `已切换到 \`${modelLabel(chosen)}\`。`
+			: `切换失败：\`${modelLabel(chosen)}\` 没有可用的凭证。\n\n${currentLine}`;
+		await deliver(() => sendChunked(target, "模型", text, cfg), "model reply");
+	};
+
+	const handleThinkingCommand = async (level: string | undefined, target: ReplyTarget, cfg: DingTalkConfig) => {
+		const current = pi.getThinkingLevel();
+		if (!level) {
+			await deliver(
+				() =>
+					sendChunked(
+						target,
+						"思考等级",
+						`当前：\`${current}\`\n\n可选：${THINKING_LEVELS.map((value) => `\`${value}\``).join(" ")}\n\n发送 \`/thinking high\` 切换。`,
+						cfg,
+					),
+				"thinking reply",
+			);
+			return;
+		}
+
+		const wanted = level.toLowerCase();
+		if (!THINKING_LEVELS.includes(wanted as ThinkingLevelName)) {
+			await deliver(
+				() =>
+					sendChunked(
+						target,
+						"思考等级",
+						`\`${level}\` 不是有效等级。可选：${THINKING_LEVELS.map((value) => `\`${value}\``).join(" ")}`,
+						cfg,
+					),
+				"thinking reply",
+			);
+			return;
+		}
+
+		pi.setThinkingLevel(wanted as ThinkingLevelName);
+		// Read back rather than echo: the level is clamped to what the model actually supports.
+		const applied = pi.getThinkingLevel();
+		const text =
+			applied === wanted
+				? `思考等级已设为 \`${applied}\`。`
+				: `已设为 \`${applied}\`（\`${wanted}\` 超出当前模型的能力，被收敛到这一级）。`;
+		await deliver(() => sendChunked(target, "思考等级", text, cfg), "thinking reply");
+	};
+
+	const handleContextCommand = async (target: ReplyTarget, cfg: DingTalkConfig) => {
+		const usage = context?.getContextUsage();
+		if (!usage) {
+			await deliver(() => sendChunked(target, "上下文", "当前拿不到上下文用量。", cfg), "context reply");
+			return;
+		}
+		const used =
+			usage.tokens === null
+				? "刚压缩过，下一次回复前无法估算"
+				: `${usage.tokens.toLocaleString()} / ${usage.contextWindow.toLocaleString()} tokens（${usage.percent ?? "?"}%）`;
+		await deliver(() => sendChunked(target, "上下文", `已用：${used}`, cfg), "context reply");
+	};
+
+	const handleCompactCommand = async (instructions: string | undefined, target: ReplyTarget, cfg: DingTalkConfig) => {
+		if (!context) return;
+		// compact() is fire-and-forget, so the outcome comes back through its callbacks.
+		context.compact({
+			customInstructions: instructions,
+			onComplete: () => {
+				void deliver(() => sendChunked(target, "压缩", "上下文压缩完成。", cfg), "compact reply");
+			},
+			onError: (error) => {
+				void deliver(() => sendChunked(target, "压缩", `压缩失败：${error.message}`, cfg), "compact reply");
+			},
+		});
+		await deliver(() => sendChunked(target, "压缩", "正在压缩上下文，完成后会通知你。", cfg), "compact reply");
+	};
+
+	const handleToolsCommand = async (target: ReplyTarget, cfg: DingTalkConfig) => {
+		const active = pi.getActiveTools();
+		const text =
+			active.length === 0
+				? "当前没有启用的工具。"
+				: `启用中的工具 ${active.length} 个：\n\n${active.map((name) => `- \`${name}\``).join("\n")}`;
+		await deliver(() => sendChunked(target, "工具", text, cfg), "tools reply");
+	};
+
+	const handleHelpCommand = async (target: ReplyTarget, cfg: DingTalkConfig) => {
+		const bridge = [
+			"**桥接命令**（在钉钉里直接生效）",
+			"- `/stop` `/abort` `停` — 中止当前任务",
+			"- `/status` `状态` — 是否忙、排队几条",
+			"- `/model [关键词]` `模型` — 查看或切换模型",
+			"- `/thinking [等级]` `思考` — 查看或切换思考等级",
+			"- `/context` `上下文` — 上下文用量",
+			"- `/compact [说明]` `压缩` — 压缩上下文",
+			"- `/tools` `工具` — 已启用的工具",
+			"- `/help` `帮助` — 本说明",
+		].join("\n");
+
+		const commands = pi.getCommands();
+		const shown = commands
+			.slice(0, 30)
+			.map((command) => `- \`/${command.name}\`${command.description ? ` — ${command.description}` : ""}`);
+		const more = commands.length > shown.length ? `\n\n…另有 ${commands.length - shown.length} 个未列出。` : "";
+		const session = shown.length === 0 ? "" : `\n\n**会话命令**（作为提示词发给 Agent）\n${shown.join("\n")}${more}`;
+
+		await deliver(() => sendChunked(target, "帮助", `${bridge}${session}`, cfg), "help reply");
+	};
+
+	/**
+	 * Give the agent a way to show, not just tell.
+	 *
+	 * A skill that verifies a page can screenshot it, but the answer travels as markdown and a
+	 * chat cannot open a local file, so the picture never arrives. Registered on session_start
+	 * rather than at load time: an unconfigured session should not grow a DingTalk tool.
+	 */
+	const registerSendImageTool = (cfg: DingTalkConfig) => {
+		pi.registerTool({
+			name: "dingtalk_send_image",
+			label: "发送图片到钉钉",
+			description:
+				"Send an existing local image file (screenshot, chart, rendered page) into the DingTalk " +
+				"conversation that asked the current question, and into any spectator groups. Use it when " +
+				"the user needs to *see* something rather than read a description of it. This tool does not " +
+				"capture screenshots; take one first, then pass its path.",
+			promptSnippet: "Send a local image file to the DingTalk conversation",
+			promptGuidelines: [
+				"Use after producing a screenshot the asker should look at, e.g. verifying a page renders correctly.",
+				"The path must already exist. Relative paths resolve against the working directory.",
+				"Prefer PNG or JPEG; DingTalk rejects anything it does not recognise as an image.",
+			],
+			parameters: SEND_IMAGE_PARAMS,
+			async execute(_toolCallId: string, params: { path: string; caption?: string; alsoGroups?: boolean }) {
+				if (!api) throw new Error("The DingTalk bridge is not active in this session.");
+
+				const resolved = isAbsolute(params.path) ? params.path : resolvePath(context?.cwd ?? ".", params.path);
+				let bytes: Buffer;
+				try {
+					bytes = readFileSync(resolved);
+				} catch (error) {
+					throw new Error(`Could not read ${resolved}: ${error instanceof Error ? error.message : String(error)}`);
+				}
+				if (bytes.byteLength === 0) throw new Error(`${resolved} is empty.`);
+
+				const mediaId = await api.uploadImage(bytes, basename(resolved));
+
+				// Only the asker by default. A terminal run is already being watched in the terminal,
+				// so mirroring its screenshots into a group is noise nobody asked for.
+				const asker = queue.peek();
+				const groups = params.alsoGroups ? mirrorTargets(cfg, asker?.conversationId) : [];
+				const delivered: string[] = [];
+
+				if (asker) {
+					if (params.caption)
+						await deliver(() => sendChunked(asker, "图片", params.caption!, cfg), "image caption");
+					await api.sendImageToTarget(asker, mediaId);
+					delivered.push(asker.conversationId);
+				}
+				for (const conversationId of groups) {
+					await deliver(
+						() => api!.sendImageToTarget({ conversationId, kind: "group" }, mediaId),
+						`image to ${conversationId}`,
+					);
+					delivered.push(conversationId);
+				}
+
+				// Not an error: nothing was asked for from DingTalk, so nothing is owed to it.
+				if (delivered.length === 0) {
+					return {
+						content: [
+							{
+								type: "text" as const,
+								text: `本次运行不是来自钉钉提问，未推送。图片在 ${resolved}。需要发到围观群请带 alsoGroups。`,
+							},
+						],
+						details: { mediaId, conversations: [] },
+					};
+				}
+				return {
+					content: [
+						{ type: "text" as const, text: `已把 ${basename(resolved)} 发送到 ${delivered.length} 个会话。` },
+					],
+					details: { mediaId, conversations: delivered },
+				};
+			},
+			// The hand-written schema stands in for a typebox TSchema, which this file will not import.
+		} as Parameters<ExtensionAPI["registerTool"]>[0]);
+	};
+
+	const handleBridgeCommand = async (command: BridgeCommand, target: ReplyTarget, cfg: DingTalkConfig) => {
+		if (!context) return;
+		if (command.kind === "stop") {
 			queue.clear();
 			await context.abort();
 			await deliver(() => sendChunked(target, "已停止", "已中止当前任务。", cfg), "stop reply");
+			return;
+		}
+		if (command.kind === "model") {
+			await handleModelCommand(command.query, target, cfg);
+			return;
+		}
+		if (command.kind === "thinking") {
+			await handleThinkingCommand(command.query, target, cfg);
+			return;
+		}
+		if (command.kind === "context") {
+			await handleContextCommand(target, cfg);
+			return;
+		}
+		if (command.kind === "compact") {
+			await handleCompactCommand(command.query, target, cfg);
+			return;
+		}
+		if (command.kind === "tools") {
+			await handleToolsCommand(target, cfg);
+			return;
+		}
+		if (command.kind === "help") {
+			await handleHelpCommand(target, cfg);
 			return;
 		}
 		const state = context.isIdle() ? "空闲" : "正在处理任务";
@@ -254,11 +569,26 @@ export default function dingTalkExtension(pi: ExtensionAPI): void {
 		}
 
 		const active = resolved.config;
+
+		// One connection per bot per machine. Reviving several sessions for the same bot splits
+		// message delivery between them, and enough duplicates make the gateway drop connections
+		// in a loop, so the later session declines instead of joining the fight.
+		const claim = acquireBotLock({ dir: defaultAgentDir(process.env), clientId: active.clientId });
+		if (!claim.lock) {
+			log(
+				"warn",
+				`另一个会话（pid ${claim.heldBy}）已在运行这个机器人，本会话不连接钉钉。停掉那个会话后重启即可接管。`,
+			);
+			return;
+		}
+		botLock = claim.lock;
+
 		config = active;
 		if (target) log("info", `config loaded from ${target.path}`);
 
 		api = new DingTalkApi(active);
 		router = new InboundRouter(active);
+		registerSendImageTool(active);
 		stream = new DingTalkStreamClient(active, {
 			onBotMessage: (message) => handleInbound(message, active),
 			onUnsupported: (raw) => log("info", `ignored an unsupported message type: ${raw.msgtype}`),
@@ -353,5 +683,7 @@ export default function dingTalkExtension(pi: ExtensionAPI): void {
 		card = undefined;
 		stream?.stop();
 		stream = undefined;
+		botLock?.release();
+		botLock = undefined;
 	});
 }

@@ -13,7 +13,7 @@
 
 import type { DingTalkConfig } from "./config.js";
 import { stripMention } from "./markdown.js";
-import type { BridgeCommand, InboundDecision, InboundMessage, ReplyTarget } from "./types.js";
+import type { BridgeCommand, BridgeCommandKind, InboundDecision, InboundMessage, ReplyTarget } from "./types.js";
 
 /** Cap on remembered message ids. DingTalk redelivers on ack timeouts, not indefinitely. */
 const SEEN_LIMIT = 512;
@@ -34,12 +34,51 @@ function notAllowedNotice(staffId: string): string {
 	return `你不在本 Agent 的白名单里，指令未执行。${who}请联系管理员把它加入 \`DINGTALK_ALLOW_USERS\`。`;
 }
 
-/** Recognize the bridge-level commands that never reach the agent. */
+/** Keyword to command, in both spellings. */
+const COMMAND_KEYWORDS = new Map<string, BridgeCommandKind>([
+	["/stop", "stop"],
+	["/abort", "stop"],
+	["停", "stop"],
+	["/status", "status"],
+	["状态", "status"],
+	["/model", "model"],
+	["/models", "model"],
+	["模型", "model"],
+	["/thinking", "thinking"],
+	["思考", "thinking"],
+	["/context", "context"],
+	["上下文", "context"],
+	["/compact", "compact"],
+	["压缩", "compact"],
+	["/tools", "tools"],
+	["工具", "tools"],
+	["/help", "help"],
+	["/commands", "help"],
+	["帮助", "help"],
+]);
+
+/**
+ * Commands that mean something with an argument. Every other keyword must stand alone, so
+ * "/status 一下部署" stays the question it is instead of being swallowed as a command.
+ */
+const TAKES_QUERY: ReadonlySet<BridgeCommandKind> = new Set<BridgeCommandKind>(["model", "thinking", "compact"]);
+
+/**
+ * Recognize the bridge-level commands that never reach the agent.
+ *
+ * Only an exact keyword counts, so "which model are you" stays a prompt. The query keeps its
+ * original case: model ids are matched against it and some are case-sensitive.
+ */
 export function parseBridgeCommand(text: string): BridgeCommand | undefined {
-	const normalized = text.trim().toLowerCase();
-	if (normalized === "/stop" || normalized === "/abort" || normalized === "停") return "stop";
-	if (normalized === "/status" || normalized === "状态") return "status";
-	return undefined;
+	const trimmed = text.trim();
+	const separator = trimmed.search(/\s/);
+	const keyword = (separator === -1 ? trimmed : trimmed.slice(0, separator)).toLowerCase();
+	const kind = COMMAND_KEYWORDS.get(keyword);
+	if (!kind) return undefined;
+
+	const query = separator === -1 ? "" : trimmed.slice(separator).trim();
+	if (query.length === 0) return { kind };
+	return TAKES_QUERY.has(kind) ? { kind, query } : undefined;
 }
 
 export function replyTargetFor(message: InboundMessage): ReplyTarget {

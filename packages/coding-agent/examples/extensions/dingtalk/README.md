@@ -65,6 +65,35 @@ Add the bot to a group and @-mention it once. The bridge logs the conversation i
 Put that id in the config file's `mirrorConversations` and restart. The group now receives
 every question and answer, including runs you start from the terminal.
 
+## Pushing without an agent
+
+`notify.ts` sends a one-way message with the same credentials, from anywhere — a shell, cron, a
+CI step, or an agent that has just finished something worth knowing about:
+
+```bash
+notify --config ~/bots/monitor.json "磁盘 90%"
+notify --config ~/bots/team.json --image ./shot.png "首页渲染结果"
+echo "$REPORT" | notify --config ~/bots/team.json --title "夜间巡检"
+notify --config ~/bots/team.json --groups "发布已开始"
+```
+
+Sending needs only an access token and the proactive robot APIs, so this opens **no Stream
+connection** and never competes with a running bridge for message delivery. That is what makes
+it safe to call while the agent is working.
+
+`--config` is mandatory and there is no discovery, no `DINGTALK_CONFIG` fallback, and no default
+bot: with several bots configured a default would eventually deliver to the wrong audience, and
+a chat message cannot be recalled. Messages go to the config's `allowUsers`; `--groups` adds its
+`mirrorConversations`. Exit status is 0 on delivery, 2 for a bad invocation or unusable config,
+and 1 when DingTalk rejects the send, so cron and CI can tell the difference.
+
+It is not wired into `package.json`'s `bin`, which would change the published command surface.
+Run it with `npx tsx <path>`, or alias it:
+
+```bash
+alias notify='npx tsx ~/.prime/agent/extensions/dingtalk/notify.ts'
+```
+
 ## Running several bots
 
 One JSON file per bot; pick one at launch:
@@ -146,9 +175,51 @@ warnings rather than ignored, so a typo does not become a silently misbehaving b
 |---|---|
 | `/stop`, `/abort`, `停` | Abort the current run and drop the queue. |
 | `/status`, `状态` | Report whether the agent is busy and how many questions are queued. |
+| `/model`, `模型` | Report the current model and how many are available. |
+| `/model <query>`, `模型 <query>` | Switch to the model matching `<query>`, e.g. `/model sonnet`. |
+| `/thinking`, `思考` | Report the current thinking level. |
+| `/thinking <level>` | Set it to `minimal`/`low`/`medium`/`high`/`xhigh`/`max`. |
+| `/context`, `上下文` | Report context usage against the window. |
+| `/compact [instructions]`, `压缩` | Compact the context, optionally steered by instructions. |
+| `/tools`, `工具` | List the active tools. |
+| `/help`, `/commands`, `帮助` | List these commands and the session's slash commands. |
 
 Anything else is sent to the agent as a normal prompt, so `/skill:...` and prompt templates
 still work.
+
+Only the commands that take an argument may carry a tail, so `/status 一下部署` stays the
+question it is rather than being swallowed as a command.
+
+`/model <query>` is matched as a substring against `provider/id` and the display name. An exact
+id wins over a longer one that merely contains it; an ambiguous query lists its candidates
+instead of guessing, because landing on the wrong model silently is worse than being asked
+again. `/thinking` reads the level back after setting it, since it is clamped to what the
+current model supports.
+
+Commands the host implements in the TUI itself — session switching, for instance — remain
+terminal-only: they never reach the extension, so a chat sees them as ordinary prompts.
+
+## Sending a screenshot
+
+Markdown cannot carry a local file and a chat cannot open a path, so a screenshot taken during a
+run would otherwise never leave the machine. When a bot is configured, the bridge registers a
+`dingtalk_send_image` tool that the agent can call with a path:
+
+```
+你: 打开首页看看渲染对不对
+Agent: (screenshots the page, then calls dingtalk_send_image with the file)
+```
+
+It delivers to the conversation that asked, plus every spectator group. A run started at the
+terminal has no asker, so the image goes to the spectator groups alone; with neither, the tool
+reports that there was nowhere to send rather than claiming success.
+
+The tool only sends a file that already exists — it takes no screenshots itself, so pair it with
+whatever your skill already uses. Images always take the proactive robot path: a session webhook
+has no image message type.
+
+The tool is registered on session start and only when a bot is configured, so an unconfigured
+session does not grow a DingTalk tool it cannot use.
 
 ## Streaming replies (optional)
 

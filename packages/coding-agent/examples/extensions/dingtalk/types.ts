@@ -60,4 +60,17 @@ export type InboundDecision =
 	| { action: "ignore"; reason: string };
 
 /** Bridge-level commands handled before anything reaches the agent. */
-export type BridgeCommand = "stop" | "status";
+/**
+ * Commands the bridge answers itself instead of forwarding to the agent.
+ *
+ * These mirror terminal affordances that a chat has no substitute for. Without them the text
+ * reaches the LLM as an ordinary prompt, so `/model` used to make the model talk *about* models
+ * while quietly staying the one it already was.
+ */
+export type BridgeCommandKind = "stop" | "status" | "model" | "thinking" | "context" | "compact" | "tools" | "help";
+
+/** `query` is present only for the commands that take an argument. */
+export interface BridgeCommand {
+	kind: BridgeCommandKind;
+	query?: string;
+}

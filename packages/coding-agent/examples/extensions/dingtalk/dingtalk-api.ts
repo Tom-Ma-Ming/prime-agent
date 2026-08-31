@@ -8,6 +8,8 @@ import type { DingTalkConfig } from "./config.js";
 import type { OutboundMessage, ReplyTarget } from "./types.js";
 
 const API_BASE = "https://api.dingtalk.com";
+/** Media upload still lives on the old host, with the token in the query string. */
+const OAPI_BASE = "https://oapi.dingtalk.com";
 /** Refresh the token this long before it actually expires. */
 const TOKEN_SAFETY_MS = 5 * 60 * 1000;
 /** A session webhook is only used while it stays valid for at least this long. */
@@ -139,6 +141,76 @@ export class DingTalkApi {
 				userIds,
 				msgKey: "sampleMarkdown",
 				msgParam: JSON.stringify({ title: message.title, text: message.text }),
+			},
+			await this.authHeaders(),
+		);
+	}
+
+	/**
+	 * Upload image bytes and return the media id that identifies them.
+	 *
+	 * This endpoint answers 200 with an `errcode` body on failure, so the status alone is not
+	 * enough to call it a success.
+	 */
+	async uploadImage(bytes: Uint8Array, filename: string): Promise<string> {
+		const token = await this.getAccessToken();
+		const form = new FormData();
+		form.append("type", "image");
+		form.append("media", new Blob([bytes]), filename);
+
+		const url = `${OAPI_BASE}/media/upload?access_token=${encodeURIComponent(token)}&type=image`;
+		const response = await this.fetchImpl(url, { method: "POST", body: form });
+		const text = await response.text();
+		if (!response.ok) {
+			throw new DingTalkApiError(`media upload failed with ${response.status}`, response.status, text);
+		}
+
+		let body: Record<string, any>;
+		try {
+			body = JSON.parse(text) as Record<string, any>;
+		} catch {
+			throw new DingTalkApiError("media upload returned non-JSON", response.status, text);
+		}
+		const mediaId = typeof body.media_id === "string" ? body.media_id : undefined;
+		if (body.errcode !== 0 || !mediaId) {
+			throw new DingTalkApiError(`media upload rejected: ${body.errmsg ?? body.errcode}`, response.status, text);
+		}
+		return mediaId;
+	}
+
+	/**
+	 * Deliver an already-uploaded image.
+	 *
+	 * Always the proactive path: a session webhook has no image message type, so preferring it
+	 * the way text does would simply drop the picture.
+	 */
+	async sendImageToTarget(target: ReplyTarget, mediaId: string): Promise<void> {
+		const msgParam = JSON.stringify({ photoURL: mediaId });
+
+		if (target.kind === "group") {
+			await this.postJson(
+				`${API_BASE}/v1.0/robot/groupMessages/send`,
+				{
+					robotCode: this.config.robotCode,
+					openConversationId: target.conversationId,
+					msgKey: "sampleImageMsg",
+					msgParam,
+				},
+				await this.authHeaders(),
+			);
+			return;
+		}
+
+		if (!target.askerStaffId) {
+			throw new DingTalkApiError("cannot send an image to a private chat without a staff id", 0, "");
+		}
+		await this.postJson(
+			`${API_BASE}/v1.0/robot/oToMessages/batchSend`,
+			{
+				robotCode: this.config.robotCode,
+				userIds: [target.askerStaffId],
+				msgKey: "sampleImageMsg",
+				msgParam,
 			},
 			await this.authHeaders(),
 		);
