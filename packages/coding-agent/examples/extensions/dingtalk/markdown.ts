@@ -106,7 +106,7 @@ export function formatQuestion(nick: string, question: string): string {
 }
 
 /** Render the answer mirrored into spectator groups, tagged with who asked. */
-export function formatAnswer(nick: string | undefined, answer: string): string {
+export function formatAnswer(nick: string | undefined, answer: string, botName: string): string {
 	const who = nick ? ` · 回复 ${nick}` : "";
-	return `**🤖 Prime Agent${who}**\n\n${answer.trim()}`;
+	return `**🤖 ${botName}${who}**\n\n${answer.trim()}`;
 }

@@ -8,6 +8,7 @@ function config(overrides: Partial<DingTalkConfig> = {}): DingTalkConfig {
 		clientId: "app-key",
 		clientSecret: "app-secret",
 		robotCode: "robot-1",
+		botName: "测试机器人",
 		allowUsers: ["staff-alice", "staff-bob"],
 		mirrorConversationIds: ["cid-team"],
 		groupMode: "mirror",

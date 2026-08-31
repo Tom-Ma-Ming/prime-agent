@@ -15,6 +15,7 @@ function config(overrides: Partial<DingTalkConfig> = {}): DingTalkConfig {
 		clientId: "app-key",
 		clientSecret: "app-secret",
 		robotCode: "app-key",
+		botName: "测试机器人",
 		allowUsers: ["staff-alice"],
 		mirrorConversationIds: ["group-watch"],
 		groupMode: "mirror",
@@ -315,6 +316,43 @@ describe("resolveConfig", () => {
 		expect(result.config).toBeUndefined();
 		expect(result.errors).toHaveLength(3);
 		expect(result.errors.join(" ")).toContain("allowUsers is required");
+	});
+
+	// Every reply used to be headed "Prime Agent", which tells the reader nothing about which of
+	// several bots answered. The name should be the bot's own.
+	describe("botName", () => {
+		it("uses an explicit name from the file", () => {
+			const result = resolveConfig({
+				env,
+				file: { path: "/bots/dingtalk-chongqing.json", contents: { botName: "重庆助手" } },
+			});
+			expect(result.config?.botName).toBe("重庆助手");
+		});
+
+		it("falls back to the environment when the file omits it", () => {
+			const result = resolveConfig({ env: { ...env, DINGTALK_BOT_NAME: "监控助手" } });
+			expect(result.config?.botName).toBe("监控助手");
+		});
+
+		it("derives a name from the config file when nothing names it", () => {
+			const result = resolveConfig({ env, file: { path: "/bots/dingtalk-chongqing.json", contents: {} } });
+			expect(result.config?.botName).toBe("chongqing");
+		});
+
+		it("keeps a file name that carries no dingtalk prefix", () => {
+			const result = resolveConfig({ env, file: { path: "/bots/ops-helper.json", contents: {} } });
+			expect(result.config?.botName).toBe("ops-helper");
+		});
+
+		it("falls back to Prime Agent when the file name carries no information", () => {
+			// `~/.prime/agent/dingtalk.json` is the documented default path; its name says nothing.
+			const result = resolveConfig({ env, file: { path: "/home/me/.prime/agent/dingtalk.json", contents: {} } });
+			expect(result.config?.botName).toBe("Prime Agent");
+		});
+
+		it("falls back to Prime Agent when configured purely from the environment", () => {
+			expect(resolveConfig({ env }).config?.botName).toBe("Prime Agent");
+		});
 	});
 
 	it("reads everything from the environment when there is no file", () => {

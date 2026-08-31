@@ -119,7 +119,7 @@ describe("stripMention", () => {
 describe("mirror formatting", () => {
 	it("labels who asked and who answered", () => {
 		expect(formatQuestion("Alice", " 跑测试 ")).toBe("**👤 Alice**\n\n跑测试");
-		expect(formatAnswer("Alice", "done")).toBe("**🤖 Prime Agent · 回复 Alice**\n\ndone");
-		expect(formatAnswer(undefined, "done")).toBe("**🤖 Prime Agent**\n\ndone");
+		expect(formatAnswer("Alice", "done", "重庆助手")).toBe("**🤖 重庆助手 · 回复 Alice**\n\ndone");
+		expect(formatAnswer(undefined, "done", "重庆助手")).toBe("**🤖 重庆助手**\n\ndone");
 	});
 });

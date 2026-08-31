@@ -47,6 +47,7 @@ function config(): DingTalkConfig {
 		clientId: "client-id",
 		clientSecret: "client-secret",
 		robotCode: "client-id",
+		botName: "测试机器人",
 		allowUsers: ["staff-1"],
 		mirrorConversationIds: [],
 		groupMode: "mirror",

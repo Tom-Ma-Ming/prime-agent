@@ -65,6 +65,9 @@ Add the bot to a group and @-mention it once. The bridge logs the conversation i
 Put that id in the config file's `mirrorConversations` and restart. The group now receives
 every question and answer, including runs you start from the terminal.
 
+Groups are entirely optional: only `allowUsers` is required. With `mirrorConversations` left out,
+private chat drives the agent as usual and nothing is broadcast anywhere.
+
 ## Pushing without an agent
 
 `notify.ts` sends a one-way message with the same credentials, from anywhere — a shell, cron, a
@@ -155,6 +158,7 @@ so it is safe to drop into `~/.prime/agent/extensions/` and have it load in ever
 | `clientId` | `DINGTALK_CLIENT_ID` | — | **Required.** The app's AppKey; also the Stream client id. |
 | `clientSecret` | `DINGTALK_CLIENT_SECRET` | — | **Required.** The app's AppSecret. |
 | `allowUsers` | `DINGTALK_ALLOW_USERS` | — | **Required.** Staff ids allowed to drive the agent. |
+| `botName` | `DINGTALK_BOT_NAME` | from the file name | Name shown on replies, so each bot reads as itself. `dingtalk-chongqing.json` becomes `chongqing`; `dingtalk.json` and an env-only setup keep `Prime Agent`. |
 | `mirrorConversations` | `DINGTALK_MIRROR_CONVERSATIONS` | empty | Group conversation ids that receive the mirror. |
 | `groupMode` | `DINGTALK_GROUP_MODE` | `mirror` | `mirror` keeps groups read-only; `interactive` lets allowlisted users drive from a group. |
 | `robotCode` | `DINGTALK_ROBOT_CODE` | `clientId` | Robot code for the proactive send APIs, when it differs from the AppKey. |

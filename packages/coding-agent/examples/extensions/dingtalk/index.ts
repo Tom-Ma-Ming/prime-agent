@@ -501,7 +501,7 @@ export default function dingTalkExtension(pi: ExtensionAPI): void {
 			return;
 		}
 		if (decision.action === "notice") {
-			await deliver(() => sendChunked(decision.target, "Prime Agent", decision.notice, cfg), "notice");
+			await deliver(() => sendChunked(decision.target, cfg.botName, decision.notice, cfg), "notice");
 			return;
 		}
 
@@ -668,13 +668,13 @@ export default function dingTalkExtension(pi: ExtensionAPI): void {
 		}
 
 		const streamedToCard = await finishCard(answer);
-		const title = target?.question ? `↩ ${summarize(target.question)}` : "Prime Agent";
+		const title = target?.question ? `↩ ${summarize(target.question)}` : cfg.botName;
 
 		if (target && !streamedToCard) {
 			await deliver(() => sendChunked(target, title, answer, cfg), "reply");
 		}
 
-		await mirror(title, formatAnswer(target?.askerNick, answer), target?.conversationId, cfg);
+		await mirror(title, formatAnswer(target?.askerNick, answer, cfg.botName), target?.conversationId, cfg);
 	});
 
 	pi.on("session_shutdown", async () => {

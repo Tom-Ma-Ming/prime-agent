@@ -24,6 +24,8 @@ export interface DingTalkConfig {
 	robotCode: string;
 	/** Staff ids allowed to drive the agent. Empty means nobody. */
 	allowUsers: string[];
+	/** Name shown on replies. Defaults to the config file's own name, so each bot reads as itself. */
+	botName: string;
 	/** Group conversations that receive a mirror of every question and answer. */
 	mirrorConversationIds: string[];
 	/** `mirror` (default): groups are read-only spectators. `interactive`: allowlisted users may drive from a group. */
@@ -62,6 +64,7 @@ interface RawSettings {
 	clientSecret?: string;
 	robotCode?: string;
 	allowUsers?: string[];
+	botName?: string;
 	mirrorConversations?: string[];
 	groupMode?: string;
 	mirrorTools?: boolean;
@@ -85,6 +88,7 @@ const FILE_KEYS: (keyof RawSettings)[] = [
 	"clientSecret",
 	"robotCode",
 	"allowUsers",
+	"botName",
 	"mirrorConversations",
 	"groupMode",
 	"mirrorTools",
@@ -140,6 +144,7 @@ function fromEnv(env: Record<string, string | undefined>, errors: string[]): Raw
 		clientSecret: envString(env, "DINGTALK_CLIENT_SECRET"),
 		robotCode: envString(env, "DINGTALK_ROBOT_CODE"),
 		allowUsers: envList(env, "DINGTALK_ALLOW_USERS"),
+		botName: envString(env, "DINGTALK_BOT_NAME"),
 		mirrorConversations: envList(env, "DINGTALK_MIRROR_CONVERSATIONS"),
 		groupMode: envString(env, "DINGTALK_GROUP_MODE"),
 		mirrorTools: envBool(env, "DINGTALK_MIRROR_TOOLS"),
@@ -211,6 +216,7 @@ function fromFile(file: ConfigFileInput, errors: string[], warnings: string[]): 
 		clientSecret: fileString(record.clientSecret, "clientSecret", path, errors),
 		robotCode: fileString(record.robotCode, "robotCode", path, errors),
 		allowUsers: fileList(record.allowUsers, "allowUsers", path, errors),
+		botName: fileString(record.botName, "botName", path, errors),
 		mirrorConversations: fileList(record.mirrorConversations, "mirrorConversations", path, errors),
 		groupMode: fileString(record.groupMode, "groupMode", path, errors),
 		mirrorTools: fileBool(record.mirrorTools, "mirrorTools", path, errors),
@@ -238,6 +244,22 @@ function merge(...sources: RawSettings[]): RawSettings {
 export function isConfigured(env: Record<string, string | undefined>, hasFile: boolean): boolean {
 	if (hasFile) return true;
 	return Object.keys(env).some((key) => key.startsWith(ENV_PREFIX) && (env[key] ?? "").trim() !== "");
+}
+
+/**
+ * Name a bot after the file that configures it.
+ *
+ * Running several bots means several config files, already named for the bot they hold, so the
+ * file name is a better default than a shared product name. `dingtalk.json` is the documented
+ * default path and says nothing about which bot it is, so it keeps the generic name.
+ */
+function deriveBotName(path: string | undefined): string {
+	const fallback = "Prime Agent";
+	if (!path) return fallback;
+	const base = path.split(/[\\/]/).pop() ?? "";
+	const stem = base.replace(/\.[^.]+$/, "");
+	const name = stem.replace(/^dingtalk[-_.]?/i, "").trim();
+	return name.length > 0 ? name : fallback;
 }
 
 /**
@@ -312,6 +334,7 @@ export function resolveConfig(input: {
 			clientId: raw.clientId!,
 			clientSecret: raw.clientSecret!,
 			robotCode: raw.robotCode ?? raw.clientId!,
+			botName: raw.botName ?? deriveBotName(input.file?.path),
 			allowUsers,
 			mirrorConversationIds,
 			groupMode,
