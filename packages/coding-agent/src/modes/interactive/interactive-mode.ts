@@ -42,12 +42,13 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
-import { spawn, spawnSync } from "child_process";
+import { spawnSync } from "child_process";
 import {
 	buildDaemonUpdateRestartReport,
 	launchDaemonUpdateRestartCoordinator,
 	resolveDaemonUpdateRestartSocketPath,
 } from "../../cli/daemon-update-restart.js";
+import { type CliSubprocessLaunchSpec, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import {
 	APP_NAME,
 	APP_TITLE,
@@ -98,6 +99,7 @@ import type { KernelSentAgentMessage } from "../../core/kernel/index.js";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.js";
 import { runMcpManagementCommand } from "../../core/mcp/mcp-command.js";
 import {
+	ASYNC_BASH_COMPLETION_PREVIEW_LABEL,
 	bashOutputToText,
 	COMPACTION_OUTCOME_CUSTOM_TYPE,
 	type CustomMessage,
@@ -135,6 +137,7 @@ import {
 import { type TruncationResult, truncateTail } from "../../core/tools/truncate.js";
 import { PRIME_BUTTERFLY_LOGO } from "../../themes/prime-logo.js";
 import { getChangelogPath, parseChangelog } from "../../utils/changelog.js";
+import { spawnHidden, spawnSyncHidden } from "../../utils/child-process.js";
 import { copyToClipboard } from "../../utils/clipboard.js";
 import { readClipboardImage } from "../../utils/clipboard-image.js";
 import { parseGitUrl } from "../../utils/git.js";
@@ -166,6 +169,7 @@ import type {
 	AgentConnectionToolDefinition,
 } from "../agent-connection/index.js";
 import { AgentConnectionPromptAdmissionError } from "../agent-connection/index.js";
+import type { SessionSummary } from "../daemon/daemon-session-list.js";
 import { getModelArgumentCompletions } from "../model-autocomplete.js";
 import {
 	checkForPackageUpdates,
@@ -208,6 +212,7 @@ import { formatKeyText, keyHint, keyText, rawKeyHint } from "./components/keybin
 import { createMermaidMarkdownTransform } from "./components/mermaid.js";
 import type { AuthSelectorProvider } from "./components/oauth-selector.js";
 import { PrimeOnboardingSplashComponent } from "./components/prime-onboarding-splash.js";
+import { styleArgumentTokens } from "./components/prompt-highlight.js";
 import {
 	MalformedRefinementOutcomeMessageComponent,
 	RefinementOutcomeMessageComponent,
@@ -222,7 +227,11 @@ import {
 	styleSlashCommandText,
 } from "./components/slash-command-message.js";
 import { SlashCommandResultMessageComponent } from "./components/slash-command-result-message.js";
-import { countDirectSubagentStatuses, SubagentSummaryLine } from "./components/subagent-summary-line.js";
+import {
+	countDirectSubagentStatuses,
+	countRosterSubagentStatuses,
+	SubagentSummaryLine,
+} from "./components/subagent-summary-line.js";
 import { ThinkingSelectorComponent } from "./components/thinking-selector.js";
 import {
 	selectLatestToolExpandHint,
@@ -304,7 +313,8 @@ function isLabeledQueuedPreview(message: string): boolean {
 	return (
 		message.startsWith(`${HEARTBEAT_PROMPT_PREVIEW_LABEL}: `) ||
 		message.startsWith(`${GOAL_CONTEXT_PREVIEW_LABEL}: `) ||
-		message.startsWith(`${AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL}: `)
+		message.startsWith(`${AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL}: `) ||
+		message.startsWith(`${ASYNC_BASH_COMPLETION_PREVIEW_LABEL}: `)
 	);
 }
 
@@ -318,9 +328,12 @@ export function styleQueuedMessagePreview(
 	isRecognizedSlashCommand: (name: string) => boolean,
 ): string {
 	const preview = formatQueuedMessagePreview(message, label);
-	if (!isLeadingSlashCommand(message, isRecognizedSlashCommand)) return theme.fg("dim", preview);
+	const styleDim = (segment: string) => theme.fg("dim", segment);
+	if (!isLeadingSlashCommand(message, isRecognizedSlashCommand)) return styleArgumentTokens(preview, styleDim);
 	const prefix = preview.slice(0, preview.length - message.length);
-	return `${theme.fg("dim", prefix)}${styleSlashCommandText(message, (rest) => theme.fg("dim", rest))}`;
+	return `${theme.fg("dim", prefix)}${styleSlashCommandText(message, (rest, includeBareSeparator) =>
+		styleArgumentTokens(rest, styleDim, includeBareSeparator),
+	)}`;
 }
 
 function isExpandable(obj: unknown): obj is Expandable {
@@ -765,6 +778,53 @@ export function buildUpdateRelaunchArgs(args: readonly string[], sessionFile: st
 	return relaunchArgs;
 }
 
+type UpdateRelaunchExecve = (file: string, args: string[], environment: Record<string, string>) => never;
+
+interface UpdateRelaunchExecOptions {
+	platform: string;
+	nodeVersion: string;
+	cwd: string;
+	previousCwd: string;
+	environment: NodeJS.ProcessEnv;
+	chdir: (directory: string) => void;
+	execve?: UpdateRelaunchExecve;
+}
+
+function execveFailureThrows(nodeVersion: string): boolean {
+	// Before Node 26.1, a failed execve syscall aborts the process instead of throwing for the fallback below.
+	const match = /^(\d+)\.(\d+)\./.exec(nodeVersion);
+	if (!match) {
+		return false;
+	}
+	const major = Number(match[1]);
+	const minor = Number(match[2]);
+	return major > 26 || (major === 26 && minor >= 1);
+}
+
+export function tryExecUpdateRelaunch(launch: CliSubprocessLaunchSpec, options: UpdateRelaunchExecOptions): boolean {
+	// Process replacement preserves the shell job and foreground terminal without retaining the old TUI.
+	if (
+		!options.execve ||
+		options.platform === "win32" ||
+		options.platform === "os400" ||
+		!execveFailureThrows(options.nodeVersion)
+	) {
+		return false;
+	}
+	const environment = Object.fromEntries(
+		Object.entries(options.environment).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+	);
+	options.chdir(options.cwd);
+	try {
+		options.execve(launch.command, [launch.command, ...launch.args], environment);
+	} catch (error) {
+		// A thrown execve must not leave the fallback's process on a changed cwd.
+		options.chdir(options.previousCwd);
+		throw error;
+	}
+	return true;
+}
+
 export function buildUpdateChildArgs(args: readonly string[], daemonSocketPath: string): string[] {
 	return args.includes("--daemon-socket") ? [...args] : [...args, "--daemon-socket", daemonSocketPath];
 }
@@ -974,6 +1034,7 @@ export class InteractiveMode {
 	private subagentSummaryLine: SubagentSummaryLine;
 	private subagentSnapshots = new Map<string, AgentConnectionRlmChildAgentSnapshot>();
 	private rlmNodeId: string | undefined;
+	private rosterBar: { summaries(): SessionSummary[]; dispose(): Promise<void> } | undefined;
 
 	private toolOutputExpanded = false;
 	private agentMessagesExpanded = false;
@@ -2790,6 +2851,8 @@ export class InteractiveMode {
 	private async rebindCurrentSession(): Promise<void> {
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
+		void this.rosterBar?.dispose();
+		this.rosterBar = undefined;
 		if (this.localSessionHost) {
 			this.uiServices = this.localSessionHost.createUiServices();
 		}
@@ -2804,6 +2867,7 @@ export class InteractiveMode {
 			this.showLoadedResources({ force: false, showDiagnosticsWhenQuiet: true });
 		}
 		this.subscribeToAgent();
+		await this.subscribeToRosterBar();
 		// A session_action_update in the unsubscribed gap above is lost; re-sync the queue post-subscription.
 		this.patchConnectionState({ sessionActions: (await this.agentConnection.getState()).sessionActions });
 		this.refreshQueueSelectionFromState();
@@ -5079,6 +5143,19 @@ export class InteractiveMode {
 		};
 	}
 
+	private async subscribeToRosterBar(): Promise<void> {
+		if (!this.agentConnection.subscribeAgentRoster) return;
+		try {
+			this.rosterBar = await this.agentConnection.subscribeAgentRoster(() => {
+				this.updateSubagentSummaryLine();
+				this.ui.requestRender();
+			});
+		} catch {
+			this.rosterBar = undefined;
+		}
+		this.updateSubagentSummaryLine();
+	}
+
 	private subscribeToAgent(): void {
 		this.unsubscribe = this.agentConnection.subscribe(async (event) => {
 			try {
@@ -5927,6 +6004,7 @@ export class InteractiveMode {
 	}
 
 	private updateSubagentSummary(child: AgentConnectionRlmChildAgentSnapshot): void {
+		// "cancelled" also covers never-bound terminal runs; AgentSession owns that rule.
 		if (child.status === "cancelled") {
 			this.removeSubagentSnapshot(child.id);
 		} else {
@@ -5946,13 +6024,19 @@ export class InteractiveMode {
 	}
 
 	private updateSubagentSummaryLine(): void {
-		const activeHeartbeatSessionIds = new Set(
-			this.heartbeatCatalog
-				.filter((heartbeat) => heartbeat.job.status === "active")
-				.map((heartbeat) => heartbeat.job.activeSessionId),
-		);
+		const rosterSummaries = this.rosterBar?.summaries();
+		// A client-owned session has no row on the public roster; only then do the
+		// snapshots carry the bar. A public parent with zero roster children shows zero.
+		const sessionOnRoster =
+			rosterSummaries?.some((row) => row.sessionId === this.connectionState?.sessionId) === true;
 		this.subagentSummaryLine.setSubagentCounts(
-			countDirectSubagentStatuses(this.subagentSnapshots.values(), this.rlmNodeId, activeHeartbeatSessionIds),
+			rosterSummaries && sessionOnRoster
+				? countRosterSubagentStatuses(rosterSummaries, {
+						activeSessionId: this.connectionState?.activeSessionId,
+						sessionId: this.connectionState?.sessionId,
+						sessionFile: this.connectionState?.sessionFile,
+					})
+				: countDirectSubagentStatuses(this.subagentSnapshots.values(), this.rlmNodeId),
 		);
 		if (!this.subagentSummaryLine.isSelectable() && this.subagentSummaryLine.focused) this.focusEditor();
 	}
@@ -8771,7 +8855,28 @@ export class InteractiveMode {
 					);
 				}
 			}
-			const relaunchResult = spawnSync(process.execPath, [...process.execArgv, entrypoint, ...relaunchArgs], {
+			const relaunch = createCliSubprocessLaunchSpec(relaunchArgs);
+			const updateProcess = process as NodeJS.Process & { execve?: UpdateRelaunchExecve };
+			try {
+				if (
+					tryExecUpdateRelaunch(relaunch, {
+						platform: process.platform,
+						nodeVersion: process.versions.node,
+						cwd: updateCwd,
+						previousCwd: process.cwd(),
+						environment: process.env,
+						chdir: (directory) => process.chdir(directory),
+						execve: updateProcess.execve,
+					})
+				) {
+					return;
+				}
+			} catch (error: unknown) {
+				console.error(
+					`Could not replace the current ${APP_NAME} process (${error instanceof Error ? error.message : String(error)}). Falling back to a child relaunch.`,
+				);
+			}
+			const relaunchResult = spawnSync(relaunch.command, relaunch.args, {
 				stdio: "inherit",
 				cwd: updateCwd,
 				env: process.env,
@@ -8990,7 +9095,7 @@ export class InteractiveMode {
 	private async handleShareCommand(): Promise<void> {
 		// Check if gh is available and logged in
 		try {
-			const authResult = spawnSync("gh", ["auth", "status"], { encoding: "utf-8" });
+			const authResult = spawnSyncHidden("gh", ["auth", "status"], { encoding: "utf-8" });
 			if (authResult.status !== 0) {
 				this.showError("GitHub CLI is not logged in. Run 'gh auth login' first.");
 				return;
@@ -9029,7 +9134,7 @@ export class InteractiveMode {
 		};
 
 		// Create a secret gist asynchronously
-		let proc: ReturnType<typeof spawn> | null = null;
+		let proc: ReturnType<typeof spawnHidden> | null = null;
 
 		loader.onAbort = () => {
 			proc?.kill();
@@ -9039,7 +9144,7 @@ export class InteractiveMode {
 
 		try {
 			const result = await new Promise<{ stdout: string; stderr: string; code: number | null }>((resolve) => {
-				proc = spawn("gh", ["gist", "create", "--public=false", tmpFile]);
+				proc = spawnHidden("gh", ["gist", "create", "--public=false", tmpFile]);
 				let stdout = "";
 				let stderr = "";
 				proc.stdout?.on("data", (data) => {
@@ -9240,6 +9345,8 @@ export class InteractiveMode {
 				return `Trace uploaded (${result.bytesStored.toLocaleString()} bytes).`;
 			case "disabled":
 				return "Trace sharing is disabled.";
+			case "unchanged":
+				return "Trace is already uploaded; no new content since the last upload.";
 			case "missing_credentials":
 				return "Trace sharing needs a Prime API key. Run /traces login.";
 			case "no_session_file":
@@ -10023,6 +10130,8 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 		if (this.unsubscribe) {
 			this.unsubscribe();
 		}
+		void this.rosterBar?.dispose();
+		this.rosterBar = undefined;
 		if (this.isInitialized) {
 			this.ui.stop({
 				preserveAltScreen: options.preserveAltScreen,
