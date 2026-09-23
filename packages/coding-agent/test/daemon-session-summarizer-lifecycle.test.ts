@@ -8,6 +8,19 @@ import { DaemonSessionSummarizer } from "../src/modes/daemon/daemon-session-summ
 // SETTLE_DEBOUNCE_MS in the module).
 const SETTLE_MS = 2000;
 
+const openAiMini = {
+	id: "gpt-4o-mini",
+	name: "GPT-4o mini",
+	api: "openai-responses",
+	provider: "openai",
+	baseUrl: "https://api.openai.com/v1",
+	reasoning: false,
+	input: ["text", "image"],
+	cost: { input: 0.15, output: 0.6, cacheRead: 0.075, cacheWrite: 0 },
+	contextWindow: 128000,
+	maxTokens: 16384,
+} satisfies ai.Model<"openai-responses">;
+
 function makeState(
 	opts: { working?: boolean; messages?: number; kind?: "top-level" | "subagent"; persisted?: unknown } = {},
 ): ActiveSessionState {
@@ -49,7 +62,7 @@ describe("DaemonSessionSummarizer lifecycle", () => {
 		{ enabled: true, maxRetries: 0 },
 	])("honors session retry settings %j on a transient summary failure", async (retry) => {
 		vi.useFakeTimers();
-		const model = ai.getModel("openai", "gpt-4o-mini");
+		const model = openAiMini;
 		const complete = vi.spyOn(ai, "completeSimple").mockResolvedValue({
 			role: "assistant",
 			content: [],
@@ -215,5 +228,40 @@ describe("DaemonSessionSummarizer lifecycle", () => {
 
 		summarizer.seed(state);
 		expect(state.summaryState).toEqual(persisted);
+	});
+
+	test("a session that errored before any work settles from the transcript, never the classifier", async () => {
+		vi.useFakeTimers();
+		// Every model request errored (e.g. provider 400s): no work was done, so a
+		// completed verdict would be fabricated. The real last event is the error.
+		const generate = vi.fn();
+		const onStatusChanged = vi.fn();
+		const summarizer = new DaemonSessionSummarizer(() => [], onStatusChanged, generate);
+		const state = makeState({ working: false });
+		Object.assign(state.runtime.session, {
+			messages: [
+				{ role: "user", content: "write a session marker and verify the file content" },
+				{ role: "assistant", content: [], stopReason: "error", errorMessage: "400 enable_thinking not supported" },
+			],
+		});
+
+		summarizer.notifyActivity(state);
+		await vi.advanceTimersByTimeAsync(SETTLE_MS + 500);
+
+		// Zero work done: the classifier must not be paid to invent a verdict.
+		expect(generate).not.toHaveBeenCalled();
+		expect(state.summaryState).toMatchObject({
+			summary: "Model request failed: 400 enable_thinking not supported",
+			taskState: "error",
+			basedOnMessageCount: 2,
+		});
+		expect((state as unknown as { appendedStatuses: unknown[] }).appendedStatuses).toEqual([
+			{
+				summary: "Model request failed: 400 enable_thinking not supported",
+				taskState: "error",
+				basedOnMessageCount: 2,
+			},
+		]);
+		expect(onStatusChanged).toHaveBeenCalled();
 	});
 });

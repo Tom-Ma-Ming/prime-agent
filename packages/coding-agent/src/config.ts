@@ -16,6 +16,7 @@ import { basename, dirname, join, posix, resolve, sep, win32 } from "path";
 import { fileURLToPath } from "url";
 import { shouldUseWindowsShell, spawnSyncHidden } from "./utils/child-process.js";
 import { normalizeSocketPath } from "./utils/daemon-socket-path.js";
+import { getNativeInstallationTarget } from "./utils/native-installation.js";
 
 // =============================================================================
 // Package Detection
@@ -343,6 +344,7 @@ export function getSelfUpdateUnavailableInstruction(
 }
 
 export function getUpdateInstruction(packageName: string): string {
+	if (isBunBinary && getNativeInstallationTarget()) return `Run: ${APP_NAME} update`;
 	const method = detectInstallMethod();
 	const command = getSelfUpdateCommandForMethod(method, packageName);
 	if (command) {
@@ -532,6 +534,27 @@ export function getAgentDir(): string {
 /** Get path to user's custom themes directory */
 export function getCustomThemesDir(): string {
 	return join(getAgentDir(), "themes");
+}
+
+/**
+ * Directory for fetched-catalog caches (provider models, MCP services,
+ * default-model pointer, Prime Inference model cache). Derived state only —
+ * never user-owned config like auth.json, settings.json, models.json, or
+ * mcp-connections.json. Caches are non-authoritative: losing them costs one
+ * cold fetch, nothing else.
+ */
+export function getCatalogCacheDir(): string {
+	return join(getAgentDir(), "catalog");
+}
+
+/** Model catalog caches: provider catalog snapshot + Prime Inference model cache. */
+export function getModelCacheDir(): string {
+	return join(getAgentDir(), "models");
+}
+
+/** MCP service catalog cache. */
+export function getMcpCacheDir(): string {
+	return join(getAgentDir(), "mcp");
 }
 
 /** Directory where daemon and client diagnostic logs are written (e.g. ~/.prime/agent/logs/). */

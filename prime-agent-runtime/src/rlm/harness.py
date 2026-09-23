@@ -1,17 +1,20 @@
 """Persistent harness-state helpers for Prime Agent's RLM kernel.
 
 The state model is intentionally small: it records prompt notes, memory,
-skills, subagent specs, and refinement events in the session-local harness
-store by default; pass ``global_=True`` for the cross-session global store.
-Execution still belongs to Prime Agent's TypeScript host and the existing
-``rlm.run`` recursion bridge.
+skills, subagent specs, and engine-recorded refinement events in the
+session-local harness store by default; pass ``global_=True`` for the
+cross-session global store. Execution still belongs to Prime Agent's
+TypeScript host and the existing ``rlm.spawn`` recursion bridge.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import stat
+import unicodedata
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +27,17 @@ HarnessScope = Literal["local", "global"]
 _DEFAULT_FILE_NAME = "harness_state.json"
 _DEFAULT_HARNESS_DIR_NAME = "harness"
 _KINDS: tuple[HarnessKind, ...] = ("prompt", "memory", "skill", "subagent")
+_REMOVED_METHOD_GUIDANCE = {
+    "record_refinement": (
+        "record_refinement was removed; refinement events are recorded automatically when refinements run"
+    ),
+    "plan_refinement": "plan_refinement was removed; use await refine.run() to schedule a refinement",
+}
+_REMOVED_WRAPPER_KINDS: dict[str, HarnessKind] = {
+    "prompt_note": "prompt",
+    "skill": "skill",
+    "subagent": "subagent",
+}
 _state_cache: dict[tuple[Path, HarnessScope], "HarnessState"] = {}
 
 
@@ -37,6 +51,76 @@ def _slug(raw: str, fallback: str) -> str:
     return (normalized or fallback)[:80]
 
 
+_CJK_TERM_CHARS = re.compile(
+    r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af"
+    r"\U00020000-\U0002a6df\U0002a700-\U0002b73f\U0002b740-\U0002b81f"
+    r"\U0002b820-\U0002ceaf\U0002ceb0-\U0002ebef\U0002ebf0-\U0002ee5f"
+    r"\U0002f800-\U0002fa1f\U00030000-\U0003134f\U00031350-\U000323af"
+    r"\U000323b0-\U0003347f]"
+)
+
+
+def _harness_query_runs(text: str) -> list[str]:
+    """Split lowercase text into word runs.
+
+    Letters, digits, and combining marks of any script share a run;
+    punctuation and symbols end it. Runs break only at CJK boundaries:
+    accented Latin stays whole (naïve) while spacing-free CJK is cut
+    apart from adjacent words it would otherwise swallow (修复login).
+    """
+    runs: list[str] = []
+    run: list[str] = []
+    run_is_cjk = False
+    for ch in text:
+        if unicodedata.category(ch).startswith("M") or ch.isalnum():
+            ch_is_cjk = bool(_CJK_TERM_CHARS.match(ch))
+            if run and ch_is_cjk != run_is_cjk:
+                runs.append("".join(run))
+                run = []
+            run_is_cjk = ch_is_cjk
+            run.append(ch)
+        elif run:
+            runs.append("".join(run))
+            run = []
+    if run:
+        runs.append("".join(run))
+    return runs
+
+
+def _harness_query_terms(query: str) -> list[str]:
+    """Tokenize a search query into lowercase substring terms.
+
+    Letters and digits of every script form terms; punctuation and symbols
+    only separate them, so ``worktree?`` never ranks entries by question
+    marks. CJK runs carry no spaces between words, so each run becomes
+    overlapping bigrams: ``修复登录`` yields ``修复``/``复登``/``登录`` and
+    still matches an entry containing ``登录故障``. Each term counts once.
+    Minimum lengths stay below the digest builder's four-character cut
+    because ``search`` tokenizes explicit queries, not mined conversation:
+    three ASCII characters keep real terms (rlm, api, cli), two characters
+    keep short words of other scripts (мир), and single characters are
+    terms only for CJK, where one character is a word.
+    """
+    terms: list[str] = []
+    seen: set[str] = set()
+    for run in _harness_query_runs(query.lower()):
+        if _CJK_TERM_CHARS.search(run):
+            # Bigrams keep whitespace-free CJK findable without single
+            # characters matching too loosely.
+            candidates = [run[i : i + 2] for i in range(len(run) - 1)] or [run]
+        elif run.isascii():
+            candidates = [run] if len(run) >= 3 else []
+        else:
+            # Other scripts space out words: lone characters match too
+            # broadly, so two characters is the floor.
+            candidates = [run] if len(run) >= 2 else []
+        for term in candidates:
+            if term not in seen:
+                seen.add(term)
+                terms.append(term)
+    return terms
+
+
 def _agent_dir() -> Path:
     raw = (
         os.environ.get("PRIME_AGENT_CODING_AGENT_DIR")
@@ -48,6 +132,8 @@ def _agent_dir() -> Path:
 
 def _resolve_global_flag(global_: bool = False, extra: dict[str, Any] | None = None) -> bool:
     extra = dict(extra or {})
+    if "path" in extra:
+        raise TypeError("path was renamed to topic; pass topic=")
     if "global" in extra:
         value = extra.pop("global")
         if not isinstance(value, bool):
@@ -101,7 +187,7 @@ class HarnessEntry:
     kind: HarnessKind
     title: str
     content: str
-    path: str = "general"
+    topic: str = "general"
     scope: HarnessScope = "local"
     reference: dict[str, Any] = field(default_factory=dict)
     arguments: dict[str, Any] = field(default_factory=dict)
@@ -114,7 +200,7 @@ class HarnessEntry:
 
 @dataclass
 class RefinementEvent:
-    """A recorded online harness-refinement pass."""
+    """A refinement pass recorded by the refinement engine; ``changes`` is empty when no edit applied."""
 
     id: str
     trigger: str
@@ -128,17 +214,123 @@ _ENTRY_FIELDS = {field.name for field in fields(HarnessEntry)}
 _REFINEMENT_FIELDS = {field.name for field in fields(RefinementEvent)}
 
 
-def _validate_python_skill_reference(reference: dict[str, Any] | None) -> dict[str, Any]:
+def _validate_python_skill_reference(reference: dict[str, Any] | None, entry_name: str = "") -> dict[str, Any]:
+    # Rejections name the entry so the caller can repair the right skill; the
+    # suffix keeps the historical message text greppable.
+    prefix = f"skill entry {entry_name!r} rejected: " if entry_name else ""
+
+    def reject(message: str) -> None:
+        raise ValueError(f"{prefix}{message}")
+
     if not isinstance(reference, dict):
-        raise ValueError("skill entries require a Python reference")
+        reject("skill entries require a Python reference")
     normalized = dict(reference)
     if normalized.get("type") != "python":
-        raise ValueError("skill reference.type must be 'python'")
+        reject("skill reference.type must be 'python'")
     if not any(isinstance(normalized.get(key), str) and normalized[key] for key in ("import", "python_import")):
-        raise ValueError("skill reference requires a Python import")
+        reject("skill reference requires a Python import")
     if not any(isinstance(normalized.get(key), str) and normalized[key] for key in ("callable", "call_pattern")):
-        raise ValueError("skill reference requires a callable or call_pattern")
+        reject("skill reference requires a callable or call_pattern")
     return normalized
+
+
+def _serialize_entry(entry: HarnessEntry) -> dict[str, Any]:
+    # Pre-topic builds rewriting the shared store drop "topic"; mirror the value under "path"
+    # so their rewrite round-trips it. Drop once no pre-topic build can reach a shared store.
+    record = asdict(entry)
+    record["path"] = entry.topic
+    return record
+
+
+def _default_topic(kind: HarnessKind) -> str:
+    return "policy" if kind == "prompt" else "general"
+
+
+def _reject_skill_only_fields(
+    kind: HarnessKind,
+    reference: dict[str, Any] | None,
+    arguments: dict[str, Any] | None,
+) -> None:
+    """Reject the skill-only call contract fields on the other kinds."""
+    if kind != "skill":
+        for name, value in (("reference", reference), ("arguments", arguments)):
+            if value is not None:
+                raise ValueError(f"{name} is only accepted for kind='skill', not kind={kind!r}")
+
+
+def _type_name(value: Any) -> str:
+    if isinstance(value, list):
+        return "a list"
+    if value == "":
+        return "an empty string"
+    return type(value).__name__
+
+
+def _describe_entry(id: Any, title: Any) -> str:
+    """Best available entry name for rejection messages."""
+    if isinstance(id, str) and id:
+        return id
+    if isinstance(title, str) and title:
+        return title
+    return "<unnamed>"
+
+
+def _require_text(kind: str, entry_name: str, field: str, value: Any) -> None:
+    if not isinstance(value, str) or not value:
+        raise ValueError(
+            f"{kind} entry {entry_name!r} rejected: {field} must be a non-empty string, got {_type_name(value)}"
+        )
+
+
+def _require_optional_text(kind: str, entry_name: str, field: str, value: Any) -> None:
+    if value is not None:
+        _require_text(kind, entry_name, field, value)
+
+
+def _require_optional_record(kind: str, entry_name: str, field: str, value: Any) -> None:
+    if value is not None and not isinstance(value, dict):
+        raise ValueError(
+            f"{kind} entry {entry_name!r} rejected: {field} must be a dict when provided, got {_type_name(value)}"
+        )
+
+
+def _validate_entry_shape(
+    kind: str,
+    entry_id: Any,
+    title: Any,
+    content: Any,
+    *,
+    topic: Any,
+    reference: Any,
+    arguments: Any,
+    metadata: Any,
+    source: Any,
+    existing: "HarnessEntry | None",
+) -> None:
+    """Reject an invalid harness entry before anything is persisted.
+
+    Every create/update/upsert write funnels through here, so a malformed
+    entry (content as a list, title as a number) fails with an actionable
+    error naming the entry and the field instead of being saved and later
+    crashing the host digest that renders every session's system prompt.
+    """
+    entry_name = _describe_entry(entry_id, title)
+    _require_text(kind, entry_name, "id", entry_id)
+    _require_text(kind, entry_name, "title", title)
+    _require_text(kind, entry_name, "content", content)
+    _require_optional_text(kind, entry_name, "topic", topic)
+    _require_optional_record(kind, entry_name, "reference", reference)
+    _require_optional_record(kind, entry_name, "arguments", arguments)
+    _require_optional_record(kind, entry_name, "metadata", metadata)
+    _require_text(kind, entry_name, "source", source)
+    if kind == "skill":
+        if reference is None:
+            # A new skill without a Python reference is invalid; an update that
+            # omits it preserves the existing reference instead.
+            if existing is None:
+                raise ValueError(f"skill entry {entry_name!r} rejected: skill entries require a Python reference")
+        else:
+            _validate_python_skill_reference(reference, entry_name)
 
 
 class HarnessState:
@@ -173,6 +365,19 @@ class HarnessState:
         # writes (e.g. the host `/refine` command) and avoid clobbering them.
         self._loaded_mtime: int | None = None
         self.load()
+
+    def _require_kind(self, kind: HarnessKind) -> None:
+        if kind not in self.entries:
+            raise ValueError(f"unknown harness kind {kind!r}; expected one of {_KINDS}")
+
+    def _kind_of(self, id: str) -> HarnessKind | None:
+        """The kind an id is stored under, if any."""
+        return next((kind for kind in _KINDS if id in self.entries[kind]), None)
+
+    def _missing_entry_message(self, kind: HarnessKind, id: str) -> str:
+        if (actual := self._kind_of(id)) is not None:
+            return f"entry {id!r} is kind={actual!r}; pass kind={actual!r}"
+        return f"{kind} entry {id!r} does not exist"
 
     def _ensure_local_writable(self) -> None:
         if self._local_write_error is not None:
@@ -231,8 +436,10 @@ class HarnessState:
                             entry_data.get("content"), str
                         ):
                             continue
-                        if not isinstance(entry_data.get("path"), str):
-                            entry_data["path"] = "general"
+                        if not isinstance(entry_data.get("topic"), str):
+                            # Older state files spell the grouping "path"; read both.
+                            stored_path = raw_entry.get("path")
+                            entry_data["topic"] = stored_path if isinstance(stored_path, str) else "general"
                         if entry_data.get("scope") not in ("local", "global"):
                             entry_data["scope"] = self.scope
                         if not isinstance(entry_data.get("source"), str):
@@ -292,7 +499,7 @@ class HarnessState:
         data = {
             "schema": 1,
             "entries": {
-                kind: {entry_id: asdict(entry) for entry_id, entry in records.items()}
+                kind: {entry_id: _serialize_entry(entry) for entry_id, entry in records.items()}
                 for kind, records in self.entries.items()
             },
             "refinements": [asdict(event) for event in self.refinements],
@@ -325,11 +532,10 @@ class HarnessState:
         content: str,
         *,
         id: str | None = None,
-        path: str = "general",
+        topic: str = "general",
         reference: dict[str, Any] | None = None,
         arguments: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
-        source: str = "agent",
         global_: bool = False,
         **kwargs: Any,
     ) -> HarnessEntry:
@@ -340,11 +546,10 @@ class HarnessState:
                 title,
                 content,
                 id=id,
-                path=path,
+                topic=topic,
                 reference=reference,
                 arguments=arguments,
                 metadata=metadata,
-                source=source,
             )
         self._ensure_local_writable()
         self._sync_from_disk()
@@ -353,11 +558,10 @@ class HarnessState:
             title,
             content,
             id=id,
-            path=path,
+            topic=topic,
             reference=reference,
             arguments=arguments,
             metadata=metadata,
-            source=source,
         )
 
     def _upsert(
@@ -367,30 +571,48 @@ class HarnessState:
         content: str,
         *,
         id: str | None = None,
-        path: str | None = None,
+        topic: str | None = None,
         reference: dict[str, Any] | None = None,
         arguments: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
         source: str = "agent",
     ) -> HarnessEntry:
-        # Caller is responsible for syncing from disk first. create()/update() sync
-        # once and then call this directly so their existence check and the write are
+        # Caller is responsible for syncing from disk first. create_memory()/update_memory()
+        # sync once and then call this directly so their existence check and the write are
         # not separated by a second reload (which could turn create-or-fail into a
         # silent update).
-        if kind not in self.entries:
-            raise ValueError(f"unknown harness kind {kind!r}; expected one of {_KINDS}")
+        self._require_kind(kind)
 
+        # Guard before the id slug and the dict lookup: a non-string title or a
+        # non-string id (falsy ids included, which the slug fallback would
+        # silently collapse) must fail with a clear rejection, not an
+        # AttributeError inside slug normalization or a TypeError from the lookup.
+        _require_text(kind, _describe_entry(id, title), "title", title)
+        if id is not None:
+            _require_text(kind, _describe_entry(id, title), "id", id)
         entry_id = id or _slug(title, kind)
         existing = self.entries[kind].get(entry_id)
+        _validate_entry_shape(
+            kind,
+            entry_id,
+            title,
+            content,
+            topic=topic,
+            reference=reference,
+            arguments=arguments,
+            metadata=metadata,
+            source=source,
+            existing=existing,
+        )
         if existing:
             existing.title = title
             existing.content = content
-            # Preserve path/reference/arguments/metadata when the caller omits them
+            # Preserve topic/reference/arguments/metadata when the caller omits them
             # (None) so updating only an entry's title or content does not reset its
-            # grouping path or wipe a skill's reference/argument contract. An explicit
+            # grouping topic or wipe a skill's reference/argument contract. An explicit
             # value (including {}) still overwrites.
-            if path is not None:
-                existing.path = path
+            if topic is not None:
+                existing.topic = topic
             if reference is not None:
                 existing.reference = dict(reference)
             if arguments is not None:
@@ -407,7 +629,7 @@ class HarnessState:
                 kind=kind,
                 title=title,
                 content=content,
-                path=path if path is not None else "general",
+                topic=topic if topic is not None else "general",
                 scope=self.scope,
                 reference=dict(reference or {}),
                 arguments=dict(arguments or {}),
@@ -423,23 +645,8 @@ class HarnessState:
         if target := self._global_target(global_, kwargs):
             return target.get(kind, id)
         self._sync_from_disk()
-        if kind not in self.entries:
-            raise ValueError(f"unknown harness kind {kind!r}; expected one of {_KINDS}")
+        self._require_kind(kind)
         return self.entries[kind].get(id)
-
-    def delete(self, kind: HarnessKind, id: str, *, global_: bool = False, **kwargs: Any) -> bool:
-        id, global_ = _strip_scope_prefix(id, global_)
-        if target := self._global_target(global_, kwargs):
-            return target.delete(kind, id)
-        self._ensure_local_writable()
-        self._sync_from_disk()
-        if kind not in self.entries:
-            raise ValueError(f"unknown harness kind {kind!r}; expected one of {_KINDS}")
-        if id not in self.entries[kind]:
-            return False
-        del self.entries[kind][id]
-        self.save()
-        return True
 
     def list(self, kind: HarnessKind | None = None, *, global_: bool = False, **kwargs: Any) -> list[HarnessEntry]:
         if target := self._global_target(global_, kwargs):
@@ -448,43 +655,51 @@ class HarnessState:
         kinds = [kind] if kind else list(_KINDS)
         records: list[HarnessEntry] = []
         for current_kind in kinds:
-            if current_kind not in self.entries:
-                raise ValueError(f"unknown harness kind {current_kind!r}; expected one of {_KINDS}")
+            self._require_kind(current_kind)
             records.extend(self.entries[current_kind].values())
-        return sorted(records, key=lambda entry: (entry.kind, entry.path, entry.title, entry.id))
+        return sorted(records, key=lambda entry: (entry.kind, entry.topic, entry.title, entry.id))
 
-    def create(
+    def create_memory(
         self,
-        kind: HarnessKind,
         title: str,
         content: str,
         *,
+        kind: HarnessKind = "memory",
+        topic: str | None = None,
         id: str | None = None,
-        path: str = "general",
+        metadata: dict[str, Any] | None = None,
         reference: dict[str, Any] | None = None,
         arguments: dict[str, Any] | None = None,
-        metadata: dict[str, Any] | None = None,
-        source: str = "agent",
         global_: bool = False,
         **kwargs: Any,
     ) -> HarnessEntry:
+        """Create a harness entry; fails when the id already exists.
+
+        Prompt notes, skills, and subagent specs are subtypes of memory, so one
+        method with ``kind`` covers them all. ``reference`` and ``arguments``
+        describe a skill's Python call contract and are rejected for other kinds.
+        ``topic`` groups entries and defaults to "policy" for prompt notes and
+        "general" otherwise.
+        """
+        self._require_kind(kind)
+        _reject_skill_only_fields(kind, reference, arguments)
         id, global_ = _strip_scope_prefix(id, global_)
         if target := self._global_target(global_, kwargs):
-            return target.create(
-                kind,
+            return target.create_memory(
                 title,
                 content,
+                kind=kind,
+                topic=topic,
                 id=id,
-                path=path,
+                metadata=metadata,
                 reference=reference,
                 arguments=arguments,
-                metadata=metadata,
-                source=source,
             )
         self._ensure_local_writable()
         self._sync_from_disk()
-        if kind not in self.entries:
-            raise ValueError(f"unknown harness kind {kind!r}; expected one of {_KINDS}")
+        _require_text(kind, _describe_entry(id, title), "title", title)
+        if id is not None:
+            _require_text(kind, _describe_entry(id, title), "id", id)
         entry_id = id or _slug(title, kind)
         if entry_id in self.entries[kind]:
             raise ValueError(f"{kind} entry {entry_id!r} already exists")
@@ -493,71 +708,11 @@ class HarnessState:
             title,
             content,
             id=entry_id,
-            path=path,
+            topic=topic if topic is not None else _default_topic(kind),
             reference=reference,
             arguments=arguments,
             metadata=metadata,
-            source=source,
         )
-
-    def update(
-        self,
-        kind: HarnessKind,
-        id: str,
-        title: str,
-        content: str,
-        *,
-        path: str | None = None,
-        reference: dict[str, Any] | None = None,
-        arguments: dict[str, Any] | None = None,
-        metadata: dict[str, Any] | None = None,
-        source: str = "agent",
-        global_: bool = False,
-        **kwargs: Any,
-    ) -> HarnessEntry:
-        id, global_ = _strip_scope_prefix(id, global_)
-        if target := self._global_target(global_, kwargs):
-            return target.update(
-                kind,
-                id,
-                title,
-                content,
-                path=path,
-                reference=reference,
-                arguments=arguments,
-                metadata=metadata,
-                source=source,
-            )
-        self._ensure_local_writable()
-        self._sync_from_disk()
-        if kind not in self.entries:
-            raise ValueError(f"unknown harness kind {kind!r}; expected one of {_KINDS}")
-        if id not in self.entries[kind]:
-            raise ValueError(f"{kind} entry {id!r} does not exist")
-        return self._upsert(
-            kind,
-            title,
-            content,
-            id=id,
-            path=path,
-            reference=reference,
-            arguments=arguments,
-            metadata=metadata,
-            source=source,
-        )
-
-    def create_memory(
-        self,
-        title: str,
-        content: str,
-        *,
-        id: str | None = None,
-        path: str = "general",
-        metadata: dict[str, Any] | None = None,
-        global_: bool = False,
-        **kwargs: Any,
-    ) -> HarnessEntry:
-        return self.create("memory", title, content, id=id, path=path, metadata=metadata, global_=global_, **kwargs)
 
     def update_memory(
         self,
@@ -565,177 +720,71 @@ class HarnessState:
         title: str,
         content: str,
         *,
-        path: str | None = None,
+        kind: HarnessKind = "memory",
+        topic: str | None = None,
         metadata: dict[str, Any] | None = None,
-        global_: bool = False,
-        **kwargs: Any,
-    ) -> HarnessEntry:
-        return self.update("memory", id, title, content, path=path, metadata=metadata, global_=global_, **kwargs)
-
-    def delete_memory(self, id: str, *, global_: bool = False, **kwargs: Any) -> bool:
-        return self.delete("memory", id, global_=global_, **kwargs)
-
-    def create_prompt_note(
-        self,
-        title: str,
-        content: str,
-        *,
-        id: str | None = None,
-        path: str = "policy",
-        metadata: dict[str, Any] | None = None,
-        global_: bool = False,
-        **kwargs: Any,
-    ) -> HarnessEntry:
-        return self.create("prompt", title, content, id=id, path=path, metadata=metadata, global_=global_, **kwargs)
-
-    def update_prompt_note(
-        self,
-        id: str,
-        title: str,
-        content: str,
-        *,
-        path: str | None = None,
-        metadata: dict[str, Any] | None = None,
-        global_: bool = False,
-        **kwargs: Any,
-    ) -> HarnessEntry:
-        return self.update("prompt", id, title, content, path=path, metadata=metadata, global_=global_, **kwargs)
-
-    def delete_prompt_note(self, id: str, *, global_: bool = False, **kwargs: Any) -> bool:
-        return self.delete("prompt", id, global_=global_, **kwargs)
-
-    def create_skill(
-        self,
-        title: str,
-        content: str,
-        *,
-        id: str | None = None,
-        path: str = "general",
         reference: dict[str, Any] | None = None,
         arguments: dict[str, Any] | None = None,
-        metadata: dict[str, Any] | None = None,
         global_: bool = False,
         **kwargs: Any,
     ) -> HarnessEntry:
-        return self.create(
-            "skill",
+        """Update an existing harness entry; omitted fields keep their value."""
+        self._require_kind(kind)
+        _reject_skill_only_fields(kind, reference, arguments)
+        id, global_ = _strip_scope_prefix(id, global_)
+        if target := self._global_target(global_, kwargs):
+            return target.update_memory(
+                id,
+                title,
+                content,
+                kind=kind,
+                topic=topic,
+                metadata=metadata,
+                reference=reference,
+                arguments=arguments,
+            )
+        self._ensure_local_writable()
+        self._sync_from_disk()
+        _require_text(kind, _describe_entry(id, title), "id", id)
+        if id not in self.entries[kind]:
+            raise ValueError(self._missing_entry_message(kind, id))
+        return self._upsert(
+            kind,
             title,
             content,
             id=id,
-            path=path,
-            reference=_validate_python_skill_reference(reference),
+            topic=topic,
+            reference=reference,
             arguments=arguments,
             metadata=metadata,
-            global_=global_,
-            **kwargs,
         )
 
-    def update_skill(
-        self,
-        id: str,
-        title: str,
-        content: str,
-        *,
-        path: str | None = None,
-        reference: dict[str, Any] | None = None,
-        arguments: dict[str, Any] | None = None,
-        metadata: dict[str, Any] | None = None,
-        global_: bool = False,
-        **kwargs: Any,
-    ) -> HarnessEntry:
-        # Only validate a reference when one is supplied; omitting it preserves the
-        # existing reference (see _upsert) rather than forcing every title/content-only
-        # update to re-send the full Python reference.
-        validated_reference = _validate_python_skill_reference(reference) if reference is not None else None
-        return self.update(
-            "skill",
-            id,
-            title,
-            content,
-            path=path,
-            reference=validated_reference,
-            arguments=arguments,
-            metadata=metadata,
-            global_=global_,
-            **kwargs,
-        )
-
-    def delete_skill(self, id: str, *, global_: bool = False, **kwargs: Any) -> bool:
-        return self.delete("skill", id, global_=global_, **kwargs)
-
-    def create_subagent(
-        self,
-        title: str,
-        content: str,
-        *,
-        id: str | None = None,
-        path: str = "general",
-        metadata: dict[str, Any] | None = None,
-        global_: bool = False,
-        **kwargs: Any,
-    ) -> HarnessEntry:
-        return self.create("subagent", title, content, id=id, path=path, metadata=metadata, global_=global_, **kwargs)
-
-    def update_subagent(
-        self,
-        id: str,
-        title: str,
-        content: str,
-        *,
-        path: str | None = None,
-        metadata: dict[str, Any] | None = None,
-        global_: bool = False,
-        **kwargs: Any,
-    ) -> HarnessEntry:
-        return self.update("subagent", id, title, content, path=path, metadata=metadata, global_=global_, **kwargs)
-
-    def delete_subagent(self, id: str, *, global_: bool = False, **kwargs: Any) -> bool:
-        return self.delete("subagent", id, global_=global_, **kwargs)
-
-    def record_refinement(
-        self,
-        trigger: str,
-        changes: list[str] | str,
-        *,
-        evidence: str = "",
-        outcome: str = "",
-        id: str | None = None,
-        global_: bool = False,
-        **kwargs: Any,
-    ) -> RefinementEvent:
+    def delete_memory(self, id: str, *, kind: HarnessKind = "memory", global_: bool = False, **kwargs: Any) -> bool:
+        """Delete a harness entry; returns False when it does not exist."""
+        self._require_kind(kind)
+        id, global_ = _strip_scope_prefix(id, global_)
         if target := self._global_target(global_, kwargs):
-            return target.record_refinement(trigger, changes, evidence=evidence, outcome=outcome, id=id)
+            return target.delete_memory(id, kind=kind)
         self._ensure_local_writable()
         self._sync_from_disk()
-        event_id = id or f"refine_{len(self.refinements) + 1:04d}"
-        normalized_changes = [changes] if isinstance(changes, str) else list(changes)
-        event = RefinementEvent(
-            id=event_id,
-            trigger=trigger,
-            changes=normalized_changes,
-            evidence=evidence,
-            outcome=outcome,
-        )
-        self.refinements.append(event)
+        if id not in self.entries[kind]:
+            if self._kind_of(id) is not None:
+                raise ValueError(self._missing_entry_message(kind, id))
+            return False
+        del self.entries[kind][id]
         self.save()
-        return event
+        return True
 
-    def plan_refinement(
-        self,
-        observation: str,
-        *,
-        failing_component: str = "",
-        next_step: str = "",
-    ) -> list[str]:
-        target = f" for {failing_component}" if failing_component else ""
-        plan = [
-            f"Diagnose the repeated failure or opportunity{target}: {observation}",
-            "Update the smallest useful prompt note, memory item, skill, or subagent spec.",
-            "Run the next action with the changed harness state, then record the outcome.",
-        ]
-        if next_step:
-            plan.append(f"Immediate validation step: {next_step}")
-        return plan
+    def __getattr__(self, name: str) -> Any:
+        # Kernels and transcripts still carry the removed names, so name the
+        # replacement instead of a bare AttributeError.
+        if guidance := _REMOVED_METHOD_GUIDANCE.get(name):
+            raise AttributeError(guidance)
+        action, _, suffix = name.partition("_")
+        kind = _REMOVED_WRAPPER_KINDS.get(suffix)
+        if kind and action in ("create", "update", "delete"):
+            raise AttributeError(f"{name} was removed; use rlm.harness.{action}_memory(..., kind={kind!r})")
+        raise AttributeError(name)
 
     def overview(self, *, max_entries_per_kind: int = 20, global_: bool = False, **kwargs: Any) -> str:
         if target := self._global_target(global_, kwargs):
@@ -746,7 +795,7 @@ class HarnessState:
             "Call contract: installed Python skills use await <skill_import>(...) or a matching shell CLI; "
             "harness skill entries are Python REPL skills and must include a Python reference plus arguments. "
             "Spawn a subagent spec by composing a concise task prompt and calling "
-            "handle = await rlm('sub-task'); admission returns immediately with rlm_child_id, name, session_dir, "
+            "handle = await rlm.spawn('sub-task', name='worker'); admission returns immediately with rlm_child_id, name, session_dir, "
             "and model, never the child's answer. Results arrive only through explicit agent_message replies or "
             "files; children reply with await agent_message.send(message, receiver_role='parent'). Use "
             "await rlm.list_subagents() to recover direct child handles and await agent_message.send(..., "
@@ -772,7 +821,7 @@ class HarnessState:
                         reference_text = f"{reference_text[:117]}..."
                     reference_summary = f" ref={reference_text}"
                 lines.append(
-                    f"  - [{entry.scope}:{entry.id}] {entry.title} ({entry.path}, v{entry.version})"
+                    f"  - [{entry.scope}:{entry.id}] {entry.title} ({entry.topic}, v{entry.version})"
                     f"{reference_summary}{argument_summary}: {summary}"
                 )
             overflow = len(self.entries[kind]) - len(records)
@@ -785,6 +834,73 @@ class HarnessState:
         else:
             lines.append("refinements: 0")
         return "\n".join(lines)
+
+    def search(
+        self,
+        query: str,
+        kind: HarnessKind | None = None,
+        limit: int = 10,
+        *,
+        global_: bool = False,
+        **kwargs: Any,
+    ) -> list[HarnessEntry]:
+        """Return harness entries ranked by weighted term overlap with *query*.
+
+        Terms are scored against an entry's title, content, topic, and id;
+        matches in more distinct fields count more. Each matched term is
+        discounted by its document frequency across the ranked corpus
+        (tf-idf style, ``weight * log(1 + N / df)``), so a rare,
+        distinctive term outranks terms present in most entries.
+        """
+        if target := self._global_target(global_, kwargs):
+            return target.search(query, kind=kind, limit=limit)
+        self._sync_from_disk()
+        if not isinstance(query, str):
+            raise TypeError(f"query must be str, got {type(query).__name__}")
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise TypeError("limit must be a positive int")
+        terms = _harness_query_terms(query)
+        if not terms:
+            return []
+
+        entries = self.list(kind, **kwargs) if kind is not None else self.list(None, **kwargs)
+
+        # Document frequency per term over the ranked corpus: a term in
+        # every entry weighs log(2), a term in one entry of N weighs
+        # log(1 + N), so rare distinctive terms outrank ubiquitous ones.
+        matches: dict[str, int] = {term: 0 for term in terms}
+        for entry in entries:
+            title = entry.title.lower()
+            content = entry.content.lower()
+            topic_and_id = f"{entry.topic} {entry.id}".lower()
+            for term in terms:
+                if term in title or term in content or term in topic_and_id:
+                    matches[term] += 1
+        term_idf = {
+            term: math.log(1 + len(entries) / count)
+            for term, count in matches.items()
+            if count > 0
+        }
+
+        def score(entry: HarnessEntry) -> float:
+            title = entry.title.lower()
+            content = entry.content.lower()
+            topic_and_id = f"{entry.topic} {entry.id}".lower()
+            total = 0.0
+            for term, idf in term_idf.items():
+                fields = (1 if term in title else 0) + (1 if term in content else 0) + (
+                    1 if term in topic_and_id else 0
+                )
+                if fields:
+                    total += idf * (1 + (fields - 1) * 0.5)
+            return total
+
+        def recency(entry: HarnessEntry) -> str:
+            return entry.updated_at if isinstance(entry.updated_at, str) else ""
+
+        ranked = sorted(entries, key=lambda e: (score(e), recency(e)), reverse=True)
+        ranked = [e for e in ranked if score(e) > 0]
+        return ranked[:limit]
 
     def snapshot(self, *, global_: bool = False, **kwargs: Any) -> dict[str, Any]:
         if target := self._global_target(global_, kwargs):

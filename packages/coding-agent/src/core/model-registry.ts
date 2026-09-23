@@ -3,7 +3,7 @@
  */
 
 import { Buffer } from "node:buffer";
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import {
 	type AnthropicMessagesCompat,
 	type Api,
@@ -22,7 +22,7 @@ import {
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 import { registerBuiltinMcpOAuthProviders } from "@earendil-works/pi-ai/mcp";
-import { registerOAuthProvider, resetOAuthProviders } from "@earendil-works/pi-ai/oauth";
+import { getXaiSubscriptionModel, registerOAuthProvider, resetOAuthProviders } from "@earendil-works/pi-ai/oauth";
 import { existsSync, readFileSync } from "fs";
 import { dirname, join } from "path";
 import { type Static, type TProperties, Type } from "typebox";
@@ -31,6 +31,9 @@ import type { TLocalizedValidationError } from "typebox/error";
 import { getAgentDir } from "../config.js";
 import { writeFileAtomicSync } from "../utils/atomic-file.js";
 import type { AuthSourceToken, AuthStatus, AuthStorage } from "./auth-storage.js";
+import { getBundledModels } from "./bundled-model-catalog.js";
+import { refreshDefaultModelCatalog } from "./default-model-catalog.js";
+import { CATALOG_REFRESH_INTERVAL_MS, CatalogCache, isCatalogOffline } from "./model-catalog-cache.js";
 import { PRIME_INFERENCE_PROVIDER_ID } from "./prime-inference-auth.js";
 import {
 	buildPrimeInferenceModels,
@@ -44,6 +47,7 @@ import {
 	isPrivatePrimeInferenceModel,
 } from "./prime-inference-models.js";
 import { BUILT_IN_PROVIDER_DISPLAY_NAMES } from "./provider-display-names.js";
+import { PROVIDER_MODEL_CATALOG_URL, parseProviderModelCatalog } from "./provider-model-catalog.js";
 import {
 	resolveConfigValueOrThrow,
 	resolveConfigValueUncached,
@@ -270,6 +274,7 @@ export type ResolvedRequestAuth =
 			ok: true;
 			apiKey?: string;
 			headers?: Record<string, string>;
+			requestModel?: Model<Api>;
 	  }
 	| {
 			ok: false;
@@ -429,20 +434,24 @@ interface PrivatePrimeAuthorizationCache {
 }
 
 function privatePrimeAuthorizationFingerprint(apiKey: string, teamId: string): string {
-	return createHash("sha256").update(apiKey).update("\0").update(teamId).digest("hex");
+	// Use the bearer token as a MAC key, not a password to hash. Keep the scope stable for disk cache reuse.
+	return createHmac("sha256", apiKey)
+		.update("prime-agent:private-prime-authorization:v1\0")
+		.update(teamId)
+		.digest("hex");
 }
 
 function isOfflineModeEnabled(): boolean {
-	const value = process.env.PI_OFFLINE;
-	if (!value) return false;
-	return value === "1" || value.toLowerCase() === "true" || value.toLowerCase() === "yes";
+	return isCatalogOffline();
 }
 
 /**
  * Model registry - loads and manages models, resolves API keys via AuthStorage.
  */
 export class ModelRegistry {
+	private readonly bundledCatalogModels = getBundledModels();
 	private models: Model<Api>[] = [];
+	private xaiModelSources = new WeakMap<Model<Api>, Model<Api>>();
 	private providerRequestConfigs: Map<string, ProviderRequestConfig> = new Map();
 	private staleProviderRequestAuthSources: Map<string, AuthSourceToken[]> = new Map();
 	private lastProviderAuthSourceTokens: Map<string, AuthSourceToken> = new Map();
@@ -455,6 +464,11 @@ export class ModelRegistry {
 	private openAICodexModelsCache: { authFingerprint: string; modelIds: Set<string>; refreshedAt: number } | undefined;
 	private backgroundPrivatePrimeAuthorization: { fingerprint: string; promise: Promise<void> } | undefined;
 	private livePrimeInferenceModels: Model<"openai-completions">[] | undefined;
+	private pendingPrimeInferenceCatalogRefresh: Promise<void> | undefined;
+	private pendingProviderCatalogRefresh: Promise<void> | undefined;
+	private readonly providerCatalog: CatalogCache<Model<Api>[]>;
+	private catalogRefreshTimer?: ReturnType<typeof setInterval>;
+	private scheduledCatalogRefresh?: Promise<void>;
 	private loadError: string | undefined = undefined;
 
 	/** Re-register dynamic OAuth providers (e.g. user MCP servers) after refresh() resets the registry. */
@@ -464,7 +478,22 @@ export class ModelRegistry {
 		readonly authStorage: AuthStorage,
 		private modelsJsonPath: string | undefined,
 	) {
+		const cachePath = (name: string) => (modelsJsonPath ? join(dirname(modelsJsonPath), "models", name) : undefined);
+		const legacyCachePaths = (name: string) =>
+			modelsJsonPath ? [join(dirname(modelsJsonPath), name), join(dirname(modelsJsonPath), "catalog", name)] : [];
+		this.providerCatalog = new CatalogCache(
+			PROVIDER_MODEL_CATALOG_URL,
+			cachePath("provider-model-catalog.v1.json"),
+			(payload) => parseProviderModelCatalog(payload, this.bundledCatalogModels),
+			legacyCachePaths("provider-model-catalog.v1.json"),
+		);
 		this.loadModels();
+		const reference = new WeakRef(this);
+		const unsubscribe = authStorage.onChange(() => {
+			const registry = reference.deref();
+			if (registry) void registry.scheduleCatalogRefresh().catch(() => {});
+			else unsubscribe();
+		});
 	}
 
 	setOnOAuthProvidersReset(hook: () => void): void {
@@ -530,11 +559,16 @@ export class ModelRegistry {
 	}
 
 	private primeInferenceCatalogCachePath(): string | undefined {
-		return this.modelsJsonPath ? join(dirname(this.modelsJsonPath), "prime-inference-models-cache.json") : undefined;
+		return this.modelsJsonPath
+			? join(dirname(this.modelsJsonPath), "models", "prime-inference-models-cache.json")
+			: undefined;
 	}
 
 	private bundledPrimeInferenceModels(): Model<"openai-completions">[] {
-		return getModels(PRIME_INFERENCE_PROVIDER_ID) as Model<"openai-completions">[];
+		return this.bundledCatalogModels.filter(
+			(model): model is Model<"openai-completions"> =>
+				model.provider === PRIME_INFERENCE_PROVIDER_ID && model.api === "openai-completions",
+		);
 	}
 
 	/**
@@ -591,7 +625,8 @@ export class ModelRegistry {
 		modelOverrides: Map<string, Map<string, ModelOverride>>,
 		livePrimeInferenceModels?: Model<"openai-completions">[],
 	): Model<Api>[] {
-		const bundledModels = getProviders().flatMap((provider) => getModels(provider as KnownProvider) as Model<Api>[]);
+		const remote = this.providerCatalog.get("public");
+		const bundledModels = remote ? [...remote, ...this.bundledPrimeInferenceModels()] : this.bundledCatalogModels;
 		return mergePrimeInferenceModels(bundledModels, livePrimeInferenceModels).map((model) => {
 			const providerOverride = overrides.get(model.provider);
 			const perModelOverrides = modelOverrides.get(model.provider);
@@ -794,7 +829,28 @@ export class ModelRegistry {
 	 * If models.json had errors, returns only built-in models.
 	 */
 	getAll(): Model<Api>[] {
-		return this.models;
+		return this.models.map((model) => this.getModelForCurrentAuth(model));
+	}
+
+	getModelForCurrentAuth(model: Model<Api>): Model<Api> {
+		if (model.provider !== "xai") return model;
+		const source = this.xaiModelSources.get(model) ?? model;
+		return this.isUsingXaiSubscription(source) ? (this.getXaiSubscriptionModel(source) ?? source) : source;
+	}
+
+	private getXaiSubscriptionModel(model: Model<Api>): Model<Api> | undefined {
+		const source = this.xaiModelSources.get(model) ?? model;
+		const subscription = getXaiSubscriptionModel(source);
+		if (subscription) this.xaiModelSources.set(subscription, source);
+		return subscription;
+	}
+
+	private isUsingXaiSubscription(model: Model<Api>): boolean {
+		return (
+			model.provider === "xai" &&
+			this.authStorage.get("xai")?.type === "oauth" &&
+			this.getProviderAuthStatus("xai").source === "stored"
+		);
 	}
 
 	/**
@@ -802,7 +858,7 @@ export class ModelRegistry {
 	 * This is a fast check that doesn't refresh OAuth tokens.
 	 */
 	getAvailable(): Model<Api>[] {
-		return this.models.filter((model) => {
+		return this.getAll().filter((model) => {
 			if (isPrivatePrimeInferenceModel(model) && !this.isAuthorizedPrivatePrimeInferenceModel(model)) {
 				return false;
 			}
@@ -815,6 +871,7 @@ export class ModelRegistry {
 	 * return from the disk/bundled fallback immediately and refresh in the background.
 	 */
 	async refreshAvailableModels(): Promise<Model<Api>[]> {
+		this.startCatalogRefreshTimer();
 		return this.runSerializedEntitlementRefresh(async () => {
 			const previousPrivateModelIds = new Set(this.authorizedPrivatePrimeInferenceModelIds);
 			const previousTeamId = this.authorizedPrivatePrimeInferenceTeamId;
@@ -822,21 +879,99 @@ export class ModelRegistry {
 			this.refresh();
 			const cachePath = this.primeInferenceCatalogCachePath();
 			if (cachePath) {
-				void refreshPrimeInferenceModels(cachePath, this.bundledPrimeInferenceModels(), {
-					offline: isOfflineModeEnabled(),
-				}).then((models) => {
-					if (!models) return;
-					this.livePrimeInferenceModels = models;
-					this.reloadModelsAfterCatalogChange();
-				});
+				const primeInferenceApiKey = await this.authStorage.getApiKey(PRIME_INFERENCE_PROVIDER_ID);
+				const primeInferenceHeaders = primeInferenceApiKey
+					? {
+							...this.authStorage.getProviderHeaders(PRIME_INFERENCE_PROVIDER_ID),
+							Authorization: `Bearer ${primeInferenceApiKey}`,
+						}
+					: undefined;
+				// Track the in-flight catalog refresh so waitForPendingModelRefreshes()
+				// can await it: session-model restore must observe the post-refresh
+				// catalog, not the pre-refresh fallback (bundled/disk snapshot).
+				this.pendingPrimeInferenceCatalogRefresh = refreshPrimeInferenceModels(
+					cachePath,
+					this.bundledPrimeInferenceModels(),
+					{
+						headers: primeInferenceHeaders,
+						offline: isOfflineModeEnabled(),
+					},
+				)
+					.then((models) => {
+						if (!models) return;
+						this.livePrimeInferenceModels = models;
+						this.reloadModelsAfterCatalogChange();
+					})
+					// Settlement, not failure, is what the waiter observes.
+					.catch(() => undefined);
 			}
 			await this.refreshPrivatePrimeInferenceAuthorization(
 				previousPrivateModelIds,
 				previousTeamId,
 				previousPrivateModels,
 			);
+			this.pendingProviderCatalogRefresh = this.refreshProviderCatalog(false).catch(() => undefined);
+			void this.pendingProviderCatalogRefresh;
 			return this.getAvailable();
 		});
+	}
+
+	private scheduleCatalogRefresh(): Promise<void> {
+		this.scheduledCatalogRefresh ??= Promise.resolve().then(async () => {
+			this.scheduledCatalogRefresh = undefined;
+			this.startCatalogRefreshTimer();
+			await this.refreshProviderCatalog(true);
+		});
+		return this.scheduledCatalogRefresh;
+	}
+
+	private async refreshProviderCatalog(force: boolean): Promise<void> {
+		await this.providerCatalog.refresh("public", { force });
+		// The catalog-defined default model rides the same cadence; failures keep the
+		// cached value and never block model discovery.
+		await refreshDefaultModelCatalog(force).catch(() => undefined);
+		this.reloadModelsAfterCatalogChange();
+	}
+
+	private startCatalogRefreshTimer(): boolean {
+		if (this.catalogRefreshTimer) return false;
+		const reference = new WeakRef(this);
+		const timer = setInterval(() => {
+			const registry = reference.deref();
+			if (registry) void registry.scheduleCatalogRefresh().catch(() => {});
+			else clearInterval(timer);
+		}, CATALOG_REFRESH_INTERVAL_MS);
+		timer.unref();
+		this.catalogRefreshTimer = timer;
+		return true;
+	}
+
+	/**
+	 * Wait (bounded by timeoutMs) for in-flight Prime Inference catalog and
+	 * private-authorization refreshes to settle.
+	 *
+	 * refreshAvailableModels() returns while the catalog fetch and the stale-cache
+	 * authorization refresh keep running in the background, so a decision taken
+	 * right after it can still see pre-refresh state (e.g. restoring a session's
+	 * saved model on a freshly restarted daemon). Returns immediately when
+	 * nothing is pending; never waits longer than timeoutMs.
+	 */
+	async waitForPendingModelRefreshes(timeoutMs: number): Promise<void> {
+		const pending: Promise<unknown>[] = [];
+		if (this.pendingPrimeInferenceCatalogRefresh) pending.push(this.pendingPrimeInferenceCatalogRefresh);
+		if (this.pendingProviderCatalogRefresh) pending.push(this.pendingProviderCatalogRefresh);
+		if (this.backgroundPrivatePrimeAuthorization?.promise) {
+			pending.push(this.backgroundPrivatePrimeAuthorization.promise);
+		}
+		if (pending.length === 0) return;
+		await Promise.race([
+			Promise.allSettled(pending),
+			new Promise<void>((resolve) => {
+				const timer = setTimeout(resolve, timeoutMs);
+				// The bounded wait must never keep the process alive on its own.
+				if (typeof timer.unref === "function") timer.unref();
+			}),
+		]);
 	}
 
 	private entitlementRefreshChain: Promise<unknown> = Promise.resolve();
@@ -1058,12 +1193,14 @@ export class ModelRegistry {
 	}
 
 	async refreshModelCatalog(): Promise<ModelCatalogSnapshot> {
+		this.startCatalogRefreshTimer();
+		await this.refreshProviderCatalog(false);
 		const availableModels = await this.refreshAvailableModels();
 		const availablePrivateModels = new Set(
 			availableModels.filter(isPrivatePrimeInferenceModel).map((model) => `${model.provider}/${model.id}`),
 		);
 		return {
-			models: this.models.filter(
+			models: this.getAll().filter(
 				(model) =>
 					!isPrivatePrimeInferenceModel(model) || availablePrivateModels.has(`${model.provider}/${model.id}`),
 			),
@@ -1096,7 +1233,12 @@ export class ModelRegistry {
 	}
 
 	async getExecutableModels(): Promise<Model<Api>[]> {
-		await this.runSerializedEntitlementRefresh(() => this.refreshPrivatePrimeInferenceAuthorization());
+		this.startCatalogRefreshTimer();
+		await this.refreshProviderCatalog(false);
+		// Subagent discovery must start the same credential-scoped Prime Inference
+		// refresh as the picker, even when no picker has opened in this session.
+		await this.refreshAvailableModels();
+		await this.waitForPendingModelRefreshes(5_000);
 		const availableModels = this.getAvailable();
 		const codexModels = availableModels.filter((model) => model.provider === "openai-codex");
 		if (codexModels.length === 0) {
@@ -1107,7 +1249,9 @@ export class ModelRegistry {
 		if (!auth.ok || !auth.apiKey) {
 			return availableModels.filter((model) => model.provider !== "openai-codex");
 		}
-		const authFingerprint = createHash("sha256").update(auth.apiKey).digest("hex");
+		const authFingerprint = createHmac("sha256", auth.apiKey)
+			.update("prime-agent:openai-codex-models:v1")
+			.digest("hex");
 		const cached = this.openAICodexModelsCache;
 		if (cached?.authFingerprint === authFingerprint && Date.now() - cached.refreshedAt < 300_000) {
 			return availableModels.filter((model) => model.provider !== "openai-codex" || cached.modelIds.has(model.id));
@@ -1147,7 +1291,8 @@ export class ModelRegistry {
 	 * Find a model by provider and ID.
 	 */
 	find(provider: string, modelId: string): Model<Api> | undefined {
-		return this.models.find((m) => m.provider === provider && m.id === modelId);
+		const model = this.models.find((m) => m.provider === provider && m.id === modelId);
+		return model ? this.getModelForCurrentAuth(model) : undefined;
 	}
 
 	/**
@@ -1430,7 +1575,7 @@ export class ModelRegistry {
 	/**
 	 * Get API key and request headers for a model.
 	 */
-	async getApiKeyAndHeaders(model: Model<Api>): Promise<ResolvedRequestAuth> {
+	async getApiKeyAndHeaders(model: Model<Api>, requestHeaders?: Record<string, string>): Promise<ResolvedRequestAuth> {
 		try {
 			const providerConfig = this.providerRequestConfigs.get(model.provider);
 			const authStorageAuth = await this.authStorage.getApiKeyWithSourceToken(model.provider, {
@@ -1455,6 +1600,25 @@ export class ModelRegistry {
 			}
 			this.setLastProviderAuthSourceToken(model.provider, apiKey === undefined ? undefined : authSourceToken);
 
+			let requestModel: Model<Api> | undefined;
+			if (model.provider === "xai") {
+				if (!apiKey) {
+					return {
+						ok: false,
+						error: "No usable xAI credential. Use /login and select an xAI entry to sign in again or configure an API key.",
+					};
+				}
+				const configuredModel = this.xaiModelSources.get(model) ?? model;
+				const subscription = authStorageAuth.credentialType === "oauth" && authSourceToken?.source === "stored";
+				requestModel = subscription ? this.getXaiSubscriptionModel(configuredModel) : configuredModel;
+				if (!requestModel) {
+					return {
+						ok: false,
+						error: `Cannot configure "${model.id}" for Grok subscription requests. Select an xAI model or use /login and select the xAI API-key entry.`,
+					};
+				}
+			}
+
 			const providerHeaders = resolveHeadersOrThrow(providerConfig?.headers, `provider "${model.provider}"`);
 			const authStorageHeaders = this.authStorage.getProviderHeaders(model.provider);
 			const modelHeaders = resolveHeadersOrThrow(
@@ -1474,10 +1638,26 @@ export class ModelRegistry {
 				headers = { ...headers, Authorization: `Bearer ${apiKey}` };
 			}
 
+			if (requestHeaders) headers = { ...headers, ...requestHeaders };
+			if (
+				model.provider === "xai" &&
+				authStorageAuth.credentialType === "oauth" &&
+				authSourceToken?.source === "stored"
+			) {
+				for (const [name, value] of Object.entries(headers ?? {})) {
+					if (name.toLowerCase() === "authorization" && value !== `Bearer ${apiKey}`) {
+						return {
+							ok: false,
+							error: "Grok subscription cannot use a custom Authorization header. Remove the header or use /login and select the xAI API-key entry.",
+						};
+					}
+				}
+			}
 			return {
 				ok: true,
 				apiKey,
 				headers: headers && Object.keys(headers).length > 0 ? headers : undefined,
+				...(requestModel ? { requestModel } : {}),
 			};
 		} catch (error) {
 			return {
@@ -1565,6 +1745,7 @@ export class ModelRegistry {
 	 * Check if a model is using OAuth credentials (subscription).
 	 */
 	isUsingOAuth(model: Model<Api>): boolean {
+		if (model.provider === "xai") return this.isUsingXaiSubscription(model);
 		const cred = this.authStorage.get(model.provider);
 		return cred?.type === "oauth";
 	}
